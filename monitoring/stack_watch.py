@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stack watch: the alerts this stack's services cannot send about themselves.
 
-  check    Every 15 minutes. Alerts when a Compose service is stopped or unhealthy, Jellyfin
+  check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Jellyfin
            stops answering, or Docker itself is down. Also keeps an ntfy dead man's switch
-           armed that fires if this host stops checking in (asleep, powered off, offline).
+           scheduled that fires if this host stops checking in (asleep, powered off, offline).
   stalled  Daily. Alerts on monitored items Sonarr/Radarr still have no file for after
            STALL_DAYS. Nothing else reports this: a request can be accepted and then wait
            forever for a release that never comes.
@@ -12,6 +12,10 @@
 
 Standard library only. Settings come from the stack's .env, with the process environment
 taking precedence; API keys are read from each service's config.xml. See docs/stack-watch.md.
+
+Nothing from an exception message or a command's stderr goes into a notification: anyone who
+knows the topic can read it, and Compose quotes .env values (credentials) in its errors. Those
+details go to the journal; notifications carry text this script wrote.
 """
 from __future__ import annotations
 
@@ -32,26 +36,51 @@ from pathlib import Path
 from typing import Callable
 
 STACK_DIR = Path(__file__).resolve().parent.parent
-MAX_DELAY_SECONDS = 3 * 86400  # ntfy.sh message-delay-limit
-MIN_DELAY_SECONDS = 10
-# A problem, or a failing run of this script, must repeat on this many consecutive runs before it
-# alerts. Absorbs container recreation on image updates and Docker still starting after boot.
+
+# How often `check` runs. install-stack-watch.sh schedules it (OnCalendar=*:0/15): change both.
+CHECK_INTERVAL = timedelta(minutes=15)
+# A problem, or a failing run of this script, must show on this many consecutive runs before it
+# alerts, and an alerted problem must be gone for this many runs before "all clear". Absorbs container
+# recreation on image updates, Docker still starting after boot, and a check that flaps.
 CONSECUTIVE_RUNS = 2
-# A sighting older than this does not count towards CONSECUTIVE_RUNS. Two 15-minute runs were missed,
-# so the host slept or the timer stopped in between: the run before a suspend and the run after
-# resume are not consecutive, and Docker is often still thawing in both.
-STALE_AFTER = timedelta(minutes=40)
-# ntfy.sh allows an anonymous IP 250 messages a day, shared with every service that alerts. Re-arming
-# the heartbeat on every run would spend 96 of them, so it is re-armed only once its delivery time
-# would move by this much, or by a 24th of the grace period when that is shorter.
-REARM_MAX_STEP = timedelta(hours=1)
-STALL_REMINDERS = 2
-MAX_EPISODES_LISTED = 4
+# A sighting older than this does not count towards CONSECUTIVE_RUNS. One missed run is tolerated; two
+# mean the host slept or the timer stopped in between, and Docker is often still thawing on both sides.
+STALE_AFTER = CHECK_INTERVAL * 5 / 2
+# ntfy.sh allows an anonymous IP 250 messages a day, shared with every service on the host that alerts.
+# The stack notification is capped at this many updates a day; the last one says the rest are muted.
+STACK_DAILY_CAP = 12
+FAILURE_REPEAT = timedelta(days=1)  # "Stack watch is failing" is re-sent this often while it lasts
+MAX_DELAY = timedelta(days=3)  # ntfy.sh's message-delay-limit
+STALL_REMINDERS = 2  # reminders about a stalled title after the digest that first listed it
+MAX_EPISODES_LISTED = 4  # a series missing more episodes than this is shown as a count
 MAX_MESSAGE_BYTES = 4096  # ntfy delivers anything longer as an attachment
-MAX_DETAIL_CHARS = 160
+MAX_DETAIL_CHARS = 160  # longest library-written error detail quoted in a notification
+LOW, DEFAULT, HIGH = 2, 3, 4  # ntfy priorities
 
 Http = Callable[..., str]
 Run = Callable[[list], str]
+
+
+@dataclass(frozen=True)
+class Timing:
+    """Spacing that protects the ntfy budget and the phone from noise."""
+    problem_age: timedelta  # a problem must span this long, as well as CONSECUTIVE_RUNS runs, to alert
+    stack_gap: timedelta  # least time between stack updates, unless a new problem appears
+    heartbeat_step: timedelta  # the scheduled "unreachable" is moved at most once per step
+    heartbeat_slop: timedelta  # timer jitter tolerated when deciding a step has passed
+    min_grace: timedelta
+
+
+REAL_TIMING = Timing(problem_age=timedelta(minutes=10), stack_gap=timedelta(hours=1),
+                     heartbeat_step=timedelta(hours=1), heartbeat_slop=timedelta(minutes=2),
+                     min_grace=timedelta(minutes=30))
+# --test: no spacing, so an alert can be forced with back-to-back runs and a short grace.
+TEST_TIMING = Timing(problem_age=timedelta(0), stack_gap=timedelta(0), heartbeat_step=timedelta(0),
+                     heartbeat_slop=timedelta(0), min_grace=timedelta(seconds=10))
+
+
+class WatchError(Exception):
+    """An error whose message this script wrote, so it is safe to put in a notification."""
 
 
 # --------------------------------------------------------------------------- config & plumbing
@@ -65,10 +94,8 @@ def parse_env_file(text: str) -> dict[str, str]:
             continue
         key, value = line.removeprefix("export ").split("=", 1)
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        else:
-            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        quoted = re.fullmatch(r"""(['"])(.*)\1(\s+#.*)?""", value)
+        value = quoted[2] if quoted else re.split(r"\s+#", value, maxsplit=1)[0]
         env[key.strip()] = value
     return env
 
@@ -87,6 +114,15 @@ def parse_duration(text: str) -> int:
     return int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
 
 
+def span(delta: timedelta) -> str:
+    """The largest whole unit, in parse_duration's format."""
+    seconds = int(delta.total_seconds())
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
 def parse_ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
@@ -97,9 +133,18 @@ def when(moment: datetime) -> str:
 
 
 def brief(error) -> str:
-    """One line of at most MAX_DETAIL_CHARS, for error text that ends up in a notification."""
+    """One line of at most MAX_DETAIL_CHARS."""
     text = " ".join(str(error).split())
     return text if len(text) <= MAX_DETAIL_CHARS else text[:MAX_DETAIL_CHARS - 1] + "…"
+
+
+def describe_failure(exc: BaseException) -> str:
+    """Text this script wrote, or the error's type and errno meaning; never the error's message."""
+    if isinstance(exc, WatchError):
+        return brief(exc)
+    if isinstance(exc, OSError) and exc.errno:
+        return f"{type(exc).__name__} ({os.strerror(exc.errno)})"
+    return type(exc).__name__
 
 
 def sequence_safe(text: str) -> str:
@@ -121,17 +166,30 @@ def run_cmd(argv: list, timeout: float = 60) -> str:
     return proc.stdout
 
 
-def load_json(path: Path) -> dict:
+def load_state(path: Path, now: datetime, dry_run: bool) -> tuple[dict, Path | None]:
+    """Returns (state, where an unreadable file was moved). A file that isn't a JSON object (power lost
+    mid-write, a bad hand edit) is moved aside, so the watch starts fresh instead of failing forever."""
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
-        return {}
+        return {}, None
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError
+        data = None
+    if isinstance(data, dict):
+        return data, None
+    aside = path.with_name(f"{path.name}.corrupt-{now.astimezone(timezone.utc):%Y%m%d%H%M%S}")
+    if not dry_run:
+        path.replace(aside)
+    return {}, aside
 
 
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    with tmp.open("w") as file:
+        file.write(json.dumps(data, indent=2, sort_keys=True))
+        file.flush()
+        os.fsync(file.fileno())
     tmp.replace(path)
 
 
@@ -143,7 +201,7 @@ class Notifier:
     title_prefix: str = ""
     dry_run: bool = False
 
-    def send(self, title: str, message: str, *, priority: int = 4, tags: tuple = (),
+    def send(self, title: str, message: str, *, priority: int = HIGH, tags: tuple = (),
              sequence_id: str | None = None, delay_until: datetime | None = None) -> None:
         # JSON publishing, because header values cannot carry non-Latin-1 text.
         body = {"topic": self.topic, "title": self.title_prefix + title, "message": message,
@@ -169,6 +227,22 @@ class Notifier:
         self.http("DELETE", f"{self.server.rstrip('/')}/{topic}/{sequence_id}", {}, None)
 
 
+@dataclass
+class Watch:
+    """What a command runs with."""
+    cfg: dict
+    notifier: Notifier
+    now: datetime
+    http: Http
+    run: Run
+    host: str
+    ident: str  # the host, made safe for sequence IDs, plus -test under --test
+    timing: Timing = REAL_TIMING
+
+    def sequence(self, kind: str) -> str:
+        return f"{self.ident}-{kind}"
+
+
 # --------------------------------------------------------------------------- stalled
 
 
@@ -179,25 +253,34 @@ def xml_tag(xml: str, tag: str) -> str:
 
 @dataclass
 class Arr:
+    name: str
     base: str
     key: str
     http: Http
 
     @classmethod
-    def from_config(cls, cfg: dict, name: str, http: Http) -> "Arr | None":
-        config_xml = Path(cfg["CONFIG_ROOT"]) / "config" / name / "config.xml"
-        if not config_xml.exists():
-            return None
-        xml = config_xml.read_text()
+    def from_config(cls, cfg: dict, name: str, http: Http) -> "Arr":
+        root = Path(cfg.get("CONFIG_ROOT") or "")
+        if not root.is_absolute():  # as Compose does; systemd would resolve it against $HOME
+            root = Path(cfg["STACK_DIR"]) / root
+        try:
+            xml = (root / "config" / name / "config.xml").read_text()
+        except OSError as exc:
+            raise WatchError(f"{name}: can't read its config.xml under CONFIG_ROOT") from exc
         base = cfg.get(f"{name.upper()}_URL") or (
             f"http://localhost:{xml_tag(xml, 'Port')}{xml_tag(xml, 'UrlBase')}")
-        return cls(base.rstrip("/"), xml_tag(xml, "ApiKey"), http)
+        return cls(name, base.rstrip("/"), xml_tag(xml, "ApiKey"), http)
 
     def get(self, path: str, **params) -> dict:
         query = urllib.parse.urlencode(
             {k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()})
-        return json.loads(self.http("GET", f"{self.base}/api/v3/{path}?{query}",
-                                    {"X-Api-Key": self.key}))
+        try:
+            return json.loads(self.http("GET", f"{self.base}/api/v3/{path}?{query}",
+                                        {"X-Api-Key": self.key}))
+        except urllib.error.HTTPError as exc:
+            raise WatchError(f"{self.name}: HTTP {exc.code}") from exc
+        except (OSError, ValueError) as exc:  # URLError and timeouts; a body that isn't JSON
+            raise WatchError(f"{self.name}: no usable answer from its API") from exc
 
     def all_records(self, path: str, **params) -> list:
         records, page = [], 1
@@ -282,7 +365,7 @@ def format_digest(items: list[Stalled], notified: dict, stall_days: float) -> tu
     groups: dict[str, list[Stalled]] = {}
     for item in sorted(items, key=lambda i: (i.group.lower(), i.detail)):
         groups.setdefault(item.group, []).append(item)
-    lines = []
+    new_lines, old_lines = [], []
     for group, members in groups.items():
         episodes = [m.detail for m in members if m.detail]
         if len(episodes) > MAX_EPISODES_LISTED:
@@ -291,43 +374,51 @@ def format_digest(items: list[Stalled], notified: dict, stall_days: float) -> tu
             label = f"{group}: {', '.join(episodes)}"
         else:
             label = group
-        new = " (new)" if any(m.key not in notified for m in members) else ""
-        lines.append(f"• {label}, waiting since {when(min(m.since for m in members))}{new}")
+        is_new = any(m.key not in notified for m in members)
+        line = f"• {label}, waiting since {when(min(m.since for m in members))}"
+        (new_lines if is_new else old_lines).append(line + " (new)" if is_new else line)
     count = len(groups)
     title = f"{count} wanted title{'s' if count != 1 else ''} not downloaded after {stall_days:g} days"
     footer = ("\n\nUsually no release exists at the allowed quality yet, or the indexer is not "
               "returning results. Details: Sonarr/Radarr > Wanted > Missing. Unmonitor a title "
               "there to stop hearing about it.")
-    shown = len(lines)
-    while True:
-        hidden = len(lines) - shown
-        message = "\n".join(lines[:shown]) + (f"\n… and {hidden} more" if hidden else "") + footer
-        if len(message.encode()) <= MAX_MESSAGE_BYTES or shown == 0:
-            return title, message
-        shown -= 1
+    # New titles first, so the title that triggered this digest is never the one cut off.
+    return title, fit_lines(new_lines + old_lines, footer)
 
 
-def run_stalled(cfg: dict, notifier: Notifier, state: dict, now: datetime, http: Http, run: Run,
-                host: str, ident: str) -> None:
+def fit_lines(lines: list[str], footer: str) -> str:
+    """As many lines as fit in one ntfy message ahead of the footer, then "… and N more"."""
+    budget = MAX_MESSAGE_BYTES - len(footer.encode())
+    used = shown = 0
+    for line in lines:
+        hidden_after = len(lines) - shown - 1
+        more = len(f"\n… and {hidden_after} more".encode()) if hidden_after else 0
+        cost = len(line.encode()) + (1 if shown else 0)
+        if used + cost + more > budget:
+            break
+        used, shown = used + cost, shown + 1
+    hidden = len(lines) - shown
+    return "\n".join(lines[:shown] + ([f"… and {hidden} more"] if hidden else [])) + footer
+
+
+def run_stalled(watch: Watch, state: dict) -> None:
+    cfg, now = watch.cfg, watch.now
     stall_days = float(cfg.get("STALL_DAYS") or 3)
     remind_days = float(cfg.get("STALL_REMIND_DAYS") or 7)
-    items: list[Stalled] = []
-    radarr = Arr.from_config(cfg, "radarr", http)
-    if radarr:
-        queued = {r.get("movieId") for r in radarr.all_records("queue")}
-        items += stalled_movies(radarr.all_records("wanted/missing", monitored=True), queued, now,
-                                stall_days)
-    sonarr = Arr.from_config(cfg, "sonarr", http)
-    if sonarr:
-        queued = {r.get("episodeId") for r in sonarr.all_records("queue")}
-        items += stalled_episodes(
-            sonarr.all_records("wanted/missing", monitored=True, includeSeries=True), queued, now,
-            stall_days)
+    radarr = Arr.from_config(cfg, "radarr", watch.http)
+    queued = {r.get("movieId") for r in radarr.all_records("queue")}
+    items = stalled_movies(radarr.all_records("wanted/missing", monitored=True), queued, now, stall_days)
+    sonarr = Arr.from_config(cfg, "sonarr", watch.http)
+    queued = {r.get("episodeId") for r in sonarr.all_records("queue")}
+    items += stalled_episodes(sonarr.all_records("wanted/missing", monitored=True, includeSeries=True),
+                              queued, now, stall_days)
 
-    notified = state.get("notified", {})
+    # Before bd9252e an entry was just the time it was first sent.
+    notified = {key: {"at": entry, "sent": 1} if isinstance(entry, str) else entry
+                for key, entry in state.get("notified", {}).items()}
     if items and digest_due(items, notified, now, remind_days, STALL_REMINDERS):
         title, message = format_digest(items, notified, stall_days)
-        notifier.send(title, message, priority=3, tags=("hourglass_flowing_sand",))
+        watch.notifier.send(title, message, priority=DEFAULT, tags=("hourglass_flowing_sand",))
         notified = {item.key: {"at": now.isoformat(),
                                "sent": notified.get(item.key, {}).get("sent", 0) + 1}
                     for item in items}
@@ -340,6 +431,7 @@ def run_stalled(cfg: dict, notifier: Notifier, state: dict, now: datetime, http:
 
 
 COMMAND_ERRORS = (RuntimeError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError)
+BLINDING_PROBLEMS = {"docker", "compose"}  # while either is up, services' states are unknown
 
 
 def stack_problems(stack_dir: Path, run: Run) -> dict[str, str]:
@@ -347,8 +439,6 @@ def stack_problems(stack_dir: Path, run: Run) -> dict[str, str]:
         config = json.loads(run(["docker", "compose", "--project-directory", str(stack_dir),
                                  "config", "--format", "json"]))
     except COMMAND_ERRORS as exc:
-        # Compose quotes .env values (credentials) in its errors, so details go to the journal only:
-        # anything in a notification is readable by whoever knows the topic.
         print(f"docker compose config failed: {exc}", file=sys.stderr)
         return {"compose": "compose: can't read the stack config (details in the journal)"}
     try:
@@ -394,92 +484,167 @@ def jellyfin_problem(url: str, http: Http) -> str | None:
         body = http("GET", url.rstrip("/") + "/health", {}, None, 10).strip()
     except urllib.error.HTTPError as exc:
         return f"jellyfin: health check returned HTTP {exc.code}"
-    except (urllib.error.URLError, OSError) as exc:
+    except OSError as exc:  # URLError and timeouts; their reason is the OS's text, not the server's
         return f"jellyfin: not answering ({brief(getattr(exc, 'reason', exc))})"
-    return None if body == "Healthy" else f"jellyfin: reports {body[:60]!r}"
+    if body == "Healthy":
+        return None
+    if body in ("Degraded", "Unhealthy"):
+        return f"jellyfin: reports {body}"
+    return "jellyfin: unexpected answer from /health"  # not Jellyfin's words, so not forwarded
 
 
-def advance(tracked: dict, problems: dict[str, str], now: datetime) -> tuple[dict, bool, bool]:
-    """Returns (tracked, changed, worsened): changed when the set of alerted problems changed,
-    worsened when that change includes a newly alerted problem."""
-    updated, worsened = {}, False
+def gather_problems(watch: Watch) -> dict[str, str]:
+    problems = stack_problems(Path(watch.cfg["STACK_DIR"]), watch.run)
+    jellyfin_url = watch.cfg.get("JELLYFIN_URL") or "http://localhost:8096"
+    if jellyfin_url.strip().lower() != "off":
+        problem = jellyfin_problem(jellyfin_url, watch.http)
+        if problem:
+            problems["jellyfin"] = problem
+    return problems
+
+
+def advance(tracked: dict, problems: dict[str, str], now: datetime, problem_age: timedelta) -> dict:
+    """Counts sightings. A problem alerts once seen on CONSECUTIVE_RUNS runs, none stale, spanning at
+    least problem_age (so a catch-up run at wake plus the timer tick seconds later is not enough). It
+    stays alerted until absent on CONSECUTIVE_RUNS runs in a row."""
+    updated = {}
     for key, description in problems.items():
         previous = tracked.get(key) or {}
         seen = parse_ts(previous.get("seen"))
         if previous.get("alerted") or (seen is not None and now - seen <= STALE_AFTER):
             count, alerted = previous["count"] + 1, previous["alerted"]
+            first = parse_ts(previous.get("first")) or seen
         else:
-            count, alerted = 1, False
-        entry = {"count": count, "alerted": alerted, "description": description,
-                 "seen": now.isoformat()}
-        if not alerted and count >= CONSECUTIVE_RUNS:
-            entry["alerted"] = worsened = True
-        updated[key] = entry
-    recovered = any(v["alerted"] for k, v in tracked.items() if k not in problems)
-    return updated, worsened or recovered, worsened
+            count, first, alerted = 1, now, False
+        if not alerted and count >= CONSECUTIVE_RUNS and now - first >= problem_age:
+            alerted = True
+        updated[key] = {"count": count, "first": first.isoformat(), "seen": now.isoformat(),
+                        "alerted": alerted, "description": description, "absent": 0}
+    for key, previous in tracked.items():
+        if key not in problems and previous.get("alerted"):
+            absent = previous.get("absent", 0) + 1
+            if absent < CONSECUTIVE_RUNS:
+                updated[key] = previous | {"absent": absent}
+    return updated
 
 
-def format_check(tracked: dict, host: str, worsened: bool) -> tuple[str, str, int]:
-    down = sorted(v["description"] for v in tracked.values() if v["alerted"])
-    if not down:
-        return f"Media stack on {host}: all clear", "Everything that was down is back up.", 2
-    count = len(down)
+def format_check(current: dict[str, str], host: str, worsened: bool) -> tuple[str, str, int]:
+    if not current:
+        return f"Media stack on {host}: all clear", "Everything that was down is back up.", LOW
+    count = len(current)
     title = f"Media stack on {host}: {count} problem{'s' if count != 1 else ''}"
-    return title, "\n".join(f"• {d}" for d in down), 4 if worsened else 3
+    return title, "\n".join(f"• {d}" for d in sorted(current.values())), HIGH if worsened else DEFAULT
 
 
-def heartbeat(cfg: dict, notifier: Notifier, previous: dict, now: datetime, host: str,
-              ident: str) -> dict:
-    sequence_id = f"{ident}-heartbeat"
-    grace_text = cfg.get("HEARTBEAT_GRACE") or "24h"
-    if grace_text.strip().lower() == "off":
-        if previous.get("armed"):
+def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
+    """Brings the "<host>-stack" notification in line with the alerted problems and returns the new
+    stack state. Returns `stack` unchanged when the update is held back or fails to send, so the next
+    run tries again."""
+    now, day = watch.now, timedelta(days=1)
+    current = {key: entry["description"] for key, entry in tracked.items() if entry["alerted"]}
+    shown = stack.get("shown", {})
+    if current == shown:
+        return stack
+    sent = sorted(t for t in map(parse_ts, stack.get("sent", [])) if now - t < day)
+    reported = {k: t for k, t in ((k, parse_ts(v)) for k, v in stack.get("reported", {}).items())
+                if now - t < day}
+    worsened = bool(current.keys() - shown.keys())
+    # A problem not reported in the last day goes out even when muted; a flapping one doesn't.
+    fresh = bool(current.keys() - shown.keys() - reported.keys())
+    if not worsened and sent and now - sent[-1] < watch.timing.stack_gap:
+        return stack
+    if len(sent) >= STACK_DAILY_CAP and not fresh:
+        print(f"Stack update muted: {STACK_DAILY_CAP} sent in the last day", file=sys.stderr)
+        return stack
+    title, message, priority = format_check(current, watch.host, worsened)
+    if len(sent) >= STACK_DAILY_CAP - 1:
+        message += (f"\n\nThis has changed {STACK_DAILY_CAP} times in a day, so updates are muted "
+                    f"until {when(sent[len(sent) - STACK_DAILY_CAP + 1] + day)}, except new problems.")
+    watch.notifier.send(title, message, priority=priority, sequence_id=watch.sequence("stack"),
+                        tags=("rotating_light",) if worsened else ("white_check_mark",))
+    return {"shown": current, "sent": [t.isoformat() for t in sent] + [now.isoformat()],
+            "reported": {k: t.isoformat() for k, t in reported.items()} | {k: now.isoformat() for k in current}}
+
+
+def parse_grace(text: str, timing: Timing) -> timedelta:
+    longest = MAX_DELAY - timing.heartbeat_step  # the alert is scheduled a step past grace
+    try:
+        grace = timedelta(seconds=parse_duration(text))
+    except ValueError:
+        grace = None
+    if grace is None or not timing.min_grace <= grace <= longest:
+        raise WatchError(f"HEARTBEAT_GRACE must be {span(timing.min_grace)} to {span(longest)}, or off")
+    return grace
+
+
+def heartbeat(watch: Watch, state: dict) -> None:
+    """Keeps a scheduled "unreachable" message (ntfy delay) ahead of the last check-in. It is moved
+    only when fewer than grace + slop remain before it goes out, to grace + step from now, so it costs
+    one message per step at any grace and never goes out before grace has passed since a check-in.
+    state["heartbeat"]["due"] is when the message goes out; comparing now to it (rather than to when it
+    was published) keeps a changed HEARTBEAT_GRACE from sending a false "back online"."""
+    now, timing, notifier = watch.now, watch.timing, watch.notifier
+    sequence_id = watch.sequence("heartbeat")
+    beat = state.setdefault("heartbeat", {})
+    grace_text = (watch.cfg.get("HEARTBEAT_GRACE") or "24h").strip()
+    if grace_text.lower() == "off":
+        if beat.get("due") or beat.get("armed"):
             notifier.delete(sequence_id)
-        return {}
-    grace = timedelta(seconds=parse_duration(grace_text))
-    if not MIN_DELAY_SECONDS <= grace.total_seconds() <= MAX_DELAY_SECONDS:
-        raise ValueError(f"HEARTBEAT_GRACE {grace_text!r} is outside ntfy's 10s to 3d delay limit")
-    last, armed = parse_ts(previous.get("last")), parse_ts(previous.get("armed"))
-    fired = armed is not None and now - armed > grace
-    if fired:
+        del state["heartbeat"]
+        return
+    grace = parse_grace(grace_text, timing)
+    if "armed" in beat:  # before this fix, the publish time was stored instead
+        # With the grace it was published under unknown, assume at least the old 24h default, so
+        # lowering the grace in the same edit can't make a delivered alert out of one that wasn't.
+        beat["due"] = (parse_ts(beat.pop("armed")) + max(grace, timedelta(hours=24))).isoformat()
+    due, last = parse_ts(beat.get("due")), parse_ts(beat.get("last"))
+    if due is not None and now > due:
+        notifier.send(f"{watch.host} is back online",
+                      f"Out of contact from {when(last or due - grace)} to {when(now)}. "
+                      f"The unreachable alert went out {when(due)}.",
+                      priority=DEFAULT, tags=("white_check_mark",), sequence_id=sequence_id)
+        del beat["due"]  # announced, so not again even if rescheduling below fails
+        due = None
+    beat["last"] = now.isoformat()
+    step, slop = timing.heartbeat_step, timing.heartbeat_slop
+    if due is None or not grace + slop < due - now <= grace + step + slop:
+        later = f" or up to {span(step)} later" if step else ""
         notifier.send(
-            f"{host} is back online",
-            f"Out of contact from {when(last or armed)} to {when(now)}. The unreachable alert went "
-            f"out {when(armed + grace)}.",
-            priority=3, tags=("white_check_mark",), sequence_id=sequence_id)
-    if armed is None or fired or now - armed >= min(REARM_MAX_STEP, grace / 24):
-        notifier.send(
-            f"{host} is unreachable",
-            f"It stopped checking in after {when(now)}, so it is asleep, powered off or offline. "
-            "Jellyfin and Seerr can't be reached until it's back.",
-            priority=4, tags=("warning",), sequence_id=sequence_id, delay_until=now + grace)
-        armed = now
-    return {"last": now.isoformat(), "armed": armed.isoformat()}
+            f"{watch.host} is unreachable",
+            f"Its last check-in was {when(now)}{later}. It is asleep, powered off or offline, or the "
+            "stack watch stopped (systemctl --user list-timers 'media-stack-*'). Jellyfin and Seerr "
+            "can't be reached until it's back.",
+            priority=HIGH, tags=("warning",), sequence_id=sequence_id, delay_until=now + grace + step)
+        beat["due"] = (now + grace + step).isoformat()
 
 
-def run_check(cfg: dict, notifier: Notifier, state: dict, now: datetime, http: Http, run: Run,
-              host: str, ident: str) -> None:
-    problems = stack_problems(Path(cfg["STACK_DIR"]), run)
-    jellyfin_url = cfg.get("JELLYFIN_URL") or "http://localhost:8096"
-    if jellyfin_url.strip().lower() != "off":
-        problem = jellyfin_problem(jellyfin_url, http)
-        if problem:
-            problems["jellyfin"] = problem
-
+def run_check(watch: Watch, state: dict) -> None:
     errors = []
-    tracked, changed, worsened = advance(state.get("tracked", {}), problems, now)
+    previous = state.get("tracked", {})
     try:
-        if changed:
-            title, message, priority = format_check(tracked, host, worsened)
-            notifier.send(title, message, priority=priority, sequence_id=f"{ident}-stack",
-                          tags=("rotating_light",) if worsened else ("white_check_mark",))
-        state["tracked"] = tracked  # not advanced if the alert failed to send, so it retries
+        problems = gather_problems(watch)
+    except Exception as exc:  # still reschedule the heartbeat, or a false "unreachable" goes out
+        errors.append(exc)
+    else:
+        tracked = advance(previous, problems, watch.now, watch.timing.problem_age)
+        if problems.keys() & BLINDING_PROBLEMS:
+            # Docker can't say how the services are, so keep what it last said rather than read its
+            # silence as recovery.
+            tracked |= {k: v for k, v in previous.items() if k.startswith("service:")}
+        # State from before the stack record: treat what was alerted then as already shown.
+        state.setdefault("stack", {"shown": {k: v["description"] for k, v in previous.items()
+                                             if v.get("alerted")}})
+        state["tracked"] = tracked
+        try:
+            state["stack"] = publish_stack(watch, tracked, state["stack"])
+        except Exception as exc:
+            errors.append(exc)
+    try:
+        heartbeat(watch, state)
     except Exception as exc:
         errors.append(exc)
-    try:
-        state["heartbeat"] = heartbeat(cfg, notifier, state.get("heartbeat", {}), now, host, ident)
-    except Exception as exc:
-        errors.append(exc)
+    for exc in errors[1:]:
+        traceback.print_exception(exc)
     if errors:
         raise errors[0]
 
@@ -487,13 +652,47 @@ def run_check(cfg: dict, notifier: Notifier, state: dict, now: datetime, http: H
 # --------------------------------------------------------------------------- entry point
 
 
+def record_failure(watch: Watch, command: str, state: dict, exc: Exception) -> None:
+    failure = state.get("failure") or {}
+    count = failure.get("count", 0) + 1
+    since = parse_ts(failure.get("since")) or watch.now
+    alerted = parse_ts(failure.get("alerted"))
+    state["failure"] = failure = {"count": count, "since": since.isoformat()}
+    if alerted:
+        failure["alerted"] = alerted.isoformat()
+    if count < CONSECUTIVE_RUNS or (alerted and watch.now - alerted < FAILURE_REPEAT):
+        return
+    try:
+        watch.notifier.send(
+            f"Stack watch on {watch.host} is failing",
+            f"'{command}' has failed {count} runs in a row, since {when(since)}: {describe_failure(exc)}. "
+            "Its alerts are off until this is fixed. Details: journalctl --user -u 'media-stack-*'",
+            priority=HIGH, tags=("warning",), sequence_id=watch.sequence(f"watch-{command}"))
+        failure["alerted"] = watch.now.isoformat()
+    except Exception:
+        traceback.print_exc()
+
+
+def record_success(watch: Watch, command: str, state: dict) -> None:
+    failure = state.pop("failure", None)
+    if not (failure and failure.get("alerted")):
+        return
+    try:
+        watch.notifier.send(f"Stack watch on {watch.host} is working again", f"'{command}' ran cleanly.",
+                            priority=LOW, tags=("white_check_mark",),
+                            sequence_id=watch.sequence(f"watch-{command}"))
+    except Exception:
+        traceback.print_exc()
+        state["failure"] = {"alerted": failure["alerted"]}  # say so next time
+
+
 def main(argv=None, environ=None, http: Http = http_request, run: Run = run_cmd,
          now: datetime | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=["check", "stalled", "disarm"])
     parser.add_argument("--test", action="store_true",
-                        help="prefix titles with TEST: and use separate state and sequence IDs, "
-                             "to force an alert without disturbing the real ones")
+                        help="prefix titles with TEST:, use separate state and sequence IDs, and drop "
+                             "the spacing between alerts, to force one without disturbing the real ones")
     parser.add_argument("--dry-run", action="store_true",
                         help="print notifications instead of sending them; state is not saved")
     args = parser.parse_args(argv)
@@ -507,56 +706,64 @@ def main(argv=None, environ=None, http: Http = http_request, run: Run = run_cmd,
         return 2
     suffix = "-test" if args.test else ""
     host = cfg.get("WATCH_HOSTNAME") or socket.gethostname()
-    ident = sequence_safe(host) + suffix
     notifier = Notifier(cfg.get("NTFY_SERVER") or "https://ntfy.sh", cfg["NTFY_TOPIC"], http,
                         "TEST: " if args.test else "", args.dry_run)
+    watch = Watch(cfg, notifier, now or datetime.now(timezone.utc), http, run, host,
+                  sequence_safe(host) + suffix, TEST_TIMING if args.test else REAL_TIMING)
     state_home = Path(cfg.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     state_name = "stalled" if args.command == "stalled" else "check"
-    state_path = Path(cfg.get("STATE_DIR") or state_home / "media-stack-watch") / (
-        f"{state_name}{suffix}.json")
-    state = load_json(state_path)
-    now = now or datetime.now(timezone.utc)
+    state_path = Path(cfg.get("STATE_DIR") or state_home / "media-stack-watch") / f"{state_name}{suffix}.json"
 
     if args.command == "disarm":
-        notifier.delete(f"{ident}-heartbeat")
-        if "heartbeat" in state and not args.dry_run:
-            state.pop("heartbeat")
-            save_json(state_path, state)
+        # Cancel first, so that a full or broken disk can't leave the alert scheduled.
+        notifier.delete(watch.sequence("heartbeat"))
+        if args.dry_run:
+            return 0
+        try:
+            state, _ = load_state(state_path, watch.now, dry_run=True)
+            if state.pop("heartbeat", None) is not None:
+                save_json(state_path, state)
+        except OSError as exc:
+            print(f"Cancelled, but can't update {state_path}: {exc}", file=sys.stderr)
+            return 1
         return 0
 
-    runner = run_check if args.command == "check" else run_stalled
-    failure_id = f"{ident}-watch-{args.command}"
     try:
-        runner(cfg, notifier, state, now, http, run, host, ident)
-    except Exception as exc:
-        traceback.print_exc()
-        state["failures"] = state.get("failures", 0) + 1
-        if state["failures"] >= CONSECUTIVE_RUNS and not state.get("failure_alerted"):
-            try:
-                notifier.send(
-                    f"Stack watch on {host} is failing",
-                    f"'{args.command}' failed {state['failures']} runs in a row: "
-                    f"{type(exc).__name__}. The alerts it provides are off until this is fixed. "
-                    "Details, kept out of notifications: journalctl --user -u 'media-stack-*'",
-                    priority=4, tags=("warning",), sequence_id=failure_id)
-                state["failure_alerted"] = True
-            except Exception:
-                traceback.print_exc()
+        state, moved_to = load_state(state_path, watch.now, args.dry_run)
         if not args.dry_run:
+            # Prove state can be saved before sending anything. If it can't (a full disk), every run
+            # would repeat the same alerts and reschedules and flood the shared ntfy budget. Sending
+            # nothing instead lets the scheduled "unreachable" go out once grace has passed.
             save_json(state_path, state)
+    except OSError as exc:
+        print(f"Can't load or save {state_path}, so nothing was sent: {exc}", file=sys.stderr)
         return 1
-
-    state.pop("failures", None)
-    if state.get("failure_alerted"):
+    if moved_to:
         try:
-            notifier.send(f"Stack watch on {host} is working again", f"'{args.command}' ran cleanly.",
-                          priority=2, tags=("white_check_mark",), sequence_id=failure_id)
-            state.pop("failure_alerted")
+            notifier.send(f"Stack watch on {host} started over",
+                          f"{state_path.name} was unreadable, so it was moved aside to {moved_to.name} and "
+                          "the watch started fresh. An alert it already sent may repeat.",
+                          priority=DEFAULT, tags=("warning",))
         except Exception:
             traceback.print_exc()
+
+    if "failures" in state:  # the counter's shape before 2026-09-15's fixes
+        state["failure"] = {"count": state.pop("failures"), "since": watch.now.isoformat()}
+        if state.pop("failure_alerted", False):
+            state["failure"]["alerted"] = watch.now.isoformat()
+    runner = run_check if args.command == "check" else run_stalled
+    try:
+        runner(watch, state)
+    except Exception as exc:
+        traceback.print_exc()
+        record_failure(watch, args.command, state, exc)
+        code = 1
+    else:
+        record_success(watch, args.command, state)
+        code = 0
     if not args.dry_run:
         save_json(state_path, state)
-    return 0
+    return code
 
 
 if __name__ == "__main__":

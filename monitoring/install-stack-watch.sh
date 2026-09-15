@@ -11,8 +11,9 @@
 #
 # The units are generated rather than shipped as static files so the absolute path to the script
 # is always correct for wherever this repo is checked out. Each service is started once by hand,
-# and must succeed, before any timer is enabled. That first `check` arms the real dead man's
-# switch.
+# and must succeed, before any timer is enabled: `stalled` first, then `check`, which schedules the
+# real dead man's switch. On a first install that fails, the switch is cancelled again, or it would
+# send "unreachable" with no timer left to keep moving it.
 #
 # User timers only run while the user's systemd instance does. Without linger that means only
 # while you are logged in, so the installer warns when linger is off.
@@ -36,6 +37,8 @@ PYTHON="$(command -v python3)" || { echo "python3 is not installed." >&2; exit 1
 
 if [ "${1:-}" = "--uninstall" ]; then
     systemctl --user disable --now "$CHECK.timer" "$STALLED.timer" 2>/dev/null || true
+    # A check still running could schedule the alert again right after disarm.
+    systemctl --user stop "$CHECK.service" "$STALLED.service" 2>/dev/null || true
     # Without this, the last scheduled "unreachable" alert still fires when its grace runs out.
     "$PYTHON" "$WATCH" disarm || echo "Could not cancel the pending unreachable alert (see above)." >&2
     rm -f "$UNIT_DIR/$CHECK.service" "$UNIT_DIR/$CHECK.timer" \
@@ -75,6 +78,7 @@ cat > "$UNIT_DIR/$CHECK.timer" <<EOF
 Description=Media stack watch every 15 minutes
 
 [Timer]
+# Must match CHECK_INTERVAL in stack_watch.py, which decides when two sightings are consecutive.
 OnCalendar=*:0/15
 AccuracySec=1min
 # Run on wake or boot if a check was due while the machine was asleep or off.
@@ -98,21 +102,32 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+was_enabled="$(systemctl --user is-enabled "$CHECK.timer" 2>/dev/null || true)"
 systemctl --user daemon-reload
 
-for unit in "$CHECK" "$STALLED"; do
+fail() {  # message
+    echo "$1" >&2
+    if [ "$was_enabled" = enabled ]; then
+        echo "The timers from the previous install are still enabled, and now run this version." >&2
+    else
+        "$PYTHON" "$WATCH" disarm >/dev/null ||
+            echo "Also run: python3 $WATCH disarm (a test check may have scheduled the real alert)" >&2
+    fi
+    exit 1
+}
+
+for unit in "$STALLED" "$CHECK"; do
     echo "Test run: $unit.service"
     if ! systemctl --user start "$unit.service"; then
         journalctl --user -u "$unit.service" --no-pager -n 30 >&2
-        echo "$unit.service failed, so no timer was enabled. Fix the error above and re-run." >&2
-        exit 1
+        fail "$unit.service failed, so no timer was enabled. Fix the error above and re-run."
     fi
 done
 
-systemctl --user enable --now "$CHECK.timer" "$STALLED.timer"
+systemctl --user enable --now "$CHECK.timer" "$STALLED.timer" || fail "Could not enable the timers."
 
 if [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" != yes ]; then
-    echo
+    echo >&2
     echo "WARNING: linger is off, so these timers stop whenever you log out. To keep them running:" >&2
     echo "    sudo loginctl enable-linger $(id -un)" >&2
 fi

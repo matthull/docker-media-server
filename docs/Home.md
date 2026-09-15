@@ -19,5 +19,6 @@ Setup guides for each service in the stack. See the [README](https://github.com/
 - [Cloudflare Tunnel](Cloudflared) — public access without port forwarding
 - [Jellyfin Plugins](Jellyfin-Plugins) — what's worth installing, and what breaks the server
 - [Notifications](Notifications) — ntfy alerting across the stack, and what not to send
+- [Stack Watch](Stack-Watch) — alerts for dead containers, an offline host and requests that never download
 - [Backups](Backups) — local tarballs, plus off-site config backups with restic
 - [Usenet Indexers](Usenet-Indexers) — recommended indexers for Prowlarr

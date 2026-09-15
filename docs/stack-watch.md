@@ -1,4 +1,4 @@
-# Stack watch
+# Stack Watch
 
 The services' own [notifications](Notifications) cover what each one can see about itself: a failed
 download, an indexer health error, a request Seerr couldn't hand off. Some failures can't report
@@ -18,39 +18,68 @@ new account.
 
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
-| **Media stack on *host*: N problems** | A Compose service is missing, exited, restarting or unhealthy; Jellyfin's `/health` isn't `Healthy`; Docker isn't answering; or the Compose file can't be read. Only after the problem shows on two checks in a row. | High |
-| **… all clear** | Everything in the alert above has recovered. It *replaces* the alert rather than adding a second notification. | Low |
-| ***host* is unreachable** | The host hasn't checked in for `HEARTBEAT_GRACE`. ntfy.sh sends this, not the host. | High |
-| ***host* is back online** | The first check after the unreachable alert fired. Says how long it was gone. | Default |
-| **N wanted titles not downloaded after 3 days** | Daily. Monitored movies or episodes with no file and nothing in the download queue, `STALL_DAYS` after they were added or released, whichever is later. Re-sent when a new title joins the list, and as a reminder every `STALL_REMIND_DAYS`, at most twice per title. | Default |
-| **Stack watch on *host* is failing** | The script itself failed two runs in a row, so its alerts are off. Replaced by "working again" when it recovers. | High |
+| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart | High if new, else Default |
+| **… all clear** | Everything above has been fine for two checks | Low |
+| ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
+| ***host* is back online** | The first check after "unreachable" went out | Default |
+| **N wanted titles not downloaded after 3 days** | Daily, when a title joins the list or is owed a reminder | Default |
+| **Stack watch on *host* is failing** | The script failed two runs in a row; repeated daily | High |
+| **Stack watch on *host* started over** | Its state file was unreadable, so it was moved aside | Default |
 
-Each kind of alert updates one notification in place (ntfy's `sequence_id`), so a problem that lasts a
-day is one notification that changes, not ninety-six.
+- **Problems** are a Compose service that is missing, exited, restarting or unhealthy; Jellyfin's
+  `/health` not saying `Healthy`; Docker not answering; or a Compose file that can't be read. While
+  Docker isn't answering, services keep the state they last had rather than being counted as recovered.
+- **The problem notification is updated in place**, and so are the heartbeat and "failing" ones (ntfy's
+  `sequence_id`), so a problem that lasts a day is one notification that changes. A new problem goes out
+  at once. Anything else (a problem clearing, or its description changing) waits until an hour after
+  the previous update, so a flapping check can't send an alert and an all clear every 30 minutes. It
+  is updated at most 12 times a day, and the 12th update says until when the rest are muted. A problem
+  that hasn't been reported in the last day still goes out while muted, so a flapping check can't hide
+  a container that dies for real.
+- **The wanted-titles digest** lists monitored movies and episodes with no file and nothing in the
+  download queue, `STALL_DAYS` after they were added or released, whichever is later. New titles come
+  first. Each title gets a reminder every `STALL_REMIND_DAYS`, at most twice.
+- **"Failing"** says what failed in words the script wrote, such as `radarr: HTTP 401`, never an error
+  message. "Working again" replaces it when the script recovers.
+
+Nothing from an error message or a command's output goes into a notification: anyone who knows the
+topic can read it, and Docker Compose quotes `.env` values (credentials) in its errors. Those details
+are in the journal.
 
 ## How the host-offline alert works
 
 A host can't report that it's gone, so it has to be reported from somewhere else. ntfy's scheduled
-messages do that without a second service. Every check publishes an "unreachable" message delayed by
-`HEARTBEAT_GRACE`, and each new one [replaces the one still
-waiting](https://docs.ntfy.sh/publish/#updating-scheduled-notifications) because they share a sequence ID. While
-the host keeps checking in, the delivery time keeps moving forward and nothing arrives. When the checks stop,
-the last scheduled message is delivered.
+messages do that without a second service. The check keeps an "unreachable" message scheduled on ntfy,
+and each new one [replaces the one still
+waiting](https://docs.ntfy.sh/publish/#updating-scheduled-notifications) because they share a sequence ID.
+While the host keeps checking in, the delivery time keeps moving forward and nothing arrives. When the
+checks stop, the last scheduled message is delivered.
 
 ntfy.sh allows an anonymous IP **250 messages a day**, shared with every service on the host that
-publishes. Re-scheduling every 15 minutes would use 96 of them. For grace periods of a day or more, the
-script re-schedules only when the delivery time would move by an hour or more. The alert can then arrive
-up to an hour *before* the grace period has fully passed since the last check-in. Shorter grace periods
-re-schedule proportionally more often.
+publishes, so the message isn't rescheduled on every check. A check moves it only once the time left
+before delivery drops to `HEARTBEAT_GRACE`, and then moves it to `HEARTBEAT_GRACE` plus an hour from now.
+That means:
 
-Setting `HEARTBEAT_GRACE=off` cancels a message that is already scheduled, and so does uninstalling.
+- the heartbeat costs **24 messages a day**, whatever the grace;
+- "unreachable" goes out between `HEARTBEAT_GRACE` and `HEARTBEAT_GRACE` + 1 hour after the last check-in,
+  never sooner.
+
+With the problem notification capped at 12 updates a day, the stack watch's worst case is about 40 of the
+250.
+
+A changed `HEARTBEAT_GRACE` takes effect on the next check, with no reinstall. The script stores when the
+scheduled message will go out, so a shorter or longer grace just reschedules it and never sends a false
+"back online".
+
+`HEARTBEAT_GRACE` can be `30m` to `71h` (ntfy.sh schedules at most 3 days ahead, less the hour), or `off`.
+`off` cancels the scheduled message on the next check, within 15 minutes, and so does uninstalling.
 Stopping the timers by hand does **not** cancel it; to do that, run
 `python3 monitoring/stack_watch.py disarm`.
 
-**Pick the grace for how the host is actually used.** On an always-on server, `1h` catches a crash
-quickly. A laptop that sleeps overnight will alert every night at `1h`. Pick something longer than
-its normal sleeps, or turn it `off` and rely on the container and Jellyfin checks. Its limits are 10s
-to 3 days (ntfy's scheduling limit).
+**Pick the grace for how the host is actually used.** On an always-on server, `1h` reports a crash one
+to two hours after it happens. A laptop that sleeps will alert every time a sleep outlasts the grace, so
+pick something longer than its normal sleeps, or turn it `off` and rely on the container and Jellyfin
+checks.
 
 ## Setup
 
@@ -60,13 +89,22 @@ to 3 days (ntfy's scheduling limit).
    | Variable | Default | Meaning |
    | -------- | ------- | ------- |
    | `NTFY_TOPIC` | required | Topic to publish to |
-   | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `10s` to `3d`, or `off` |
+   | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `30m` to `71h`, or `off` |
    | `STALL_DAYS` | `3` | Days a wanted title may wait before the digest lists it |
    | `STALL_REMIND_DAYS` | `7` | Days between reminders about the same titles |
    | `JELLYFIN_URL` | `http://localhost:8096` | Jellyfin from this host, or `off` |
+   | `WATCH_HOSTNAME` | the hostname | Name in titles and the heartbeat's sequence ID; see below |
+   | `NTFY_SERVER` | `https://ntfy.sh` | A self-hosted ntfy server; use https |
+   | `SONARR_URL`, `RADARR_URL` | from `config.xml` | For an *arr that isn't on `localhost` at its configured port and URL base |
+   | `STATE_DIR` | `~/.local/state/media-stack-watch` | Where the script keeps its state |
 
    Blank values use the default; only `off` turns a check off. API keys are read from each service's
-   `config.xml` under `CONFIG_ROOT`, so there is nothing else to configure.
+   `config.xml` under `CONFIG_ROOT` (a relative `CONFIG_ROOT` is taken from the repo root, as Compose
+   does). A missing `config.xml` is reported as a failure rather than skipped.
+
+   **Before changing `WATCH_HOSTNAME`, or the machine's hostname, run
+   `python3 monitoring/stack_watch.py disarm`.** The heartbeat's sequence ID is built from the name, so the
+   alert scheduled under the old name would otherwise still go out. The name is in every notification.
 
 3. Install, as the user that runs Docker (no sudo):
 
@@ -74,9 +112,11 @@ to 3 days (ntfy's scheduling limit).
    ./monitoring/install-stack-watch.sh
    ```
 
-   It runs each check once by hand, and stops without enabling anything if one fails. Then it enables
-   `media-stack-watch.timer` (every 15 minutes) and `media-stack-stalled.timer` (daily at 10:00). Both have
-   `Persistent=true`, so a run that was due while the machine slept happens when it wakes.
+   It runs the digest and then a check once by hand. If either fails on a first install, it cancels the
+   heartbeat that check may have scheduled and enables nothing. On an update, the timers from the previous
+   install stay enabled and run the new script. Then it enables `media-stack-watch.timer` (every 15
+   minutes) and `media-stack-stalled.timer` (daily at 10:00). Both have `Persistent=true`, so a run that
+   was due while the machine slept happens when it wakes.
 
    User timers only run while your user's systemd instance does. If the installer warns that linger is
    off, run `sudo loginctl enable-linger $USER`, or the watch stops whenever you log out.
@@ -87,9 +127,10 @@ Logs are in `journalctl --user -u 'media-stack-*'`, and state is in `~/.local/st
 
 ## Testing
 
-Force each alert once after installing. `--test` prefixes titles with `TEST:` and uses its own state
-file and sequence IDs, so a forced alert never touches the real ones. `--dry-run` prints what would be
-sent and saves nothing.
+Force each alert once after installing. `--test` prefixes titles with `TEST:`, uses its own state file and
+sequence IDs, and drops the spacing between alerts (the 10-minute span, the hour between updates, the hour
+added to the heartbeat), so back-to-back runs force an alert and a grace as short as `10s` is allowed.
+`--dry-run` prints what would be sent and saves nothing.
 
 Put `HEARTBEAT_GRACE=off` on every `check --test` except the heartbeat test. Otherwise each one schedules a
 `TEST:` unreachable alert that goes out a day later.
@@ -105,18 +146,23 @@ Run these from the repo root, one step at a time.
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
-   Then start it again. The next check sends "… all clear".
+   Then start it again. The next two checks send "… all clear".
 
    ```bash
    docker start bazarr
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
-2. **Jellyfin not answering**, by pointing at a closed port twice, then one normal check for the all clear.
+   Stopping the container is real: the installed timer sees it too. **Start it again within 15 minutes**,
+   or the real watch sends a real alert.
+
+2. **Jellyfin not answering**, by pointing at a closed port twice, then two normal checks for the all clear.
 
    ```bash
    JELLYFIN_URL=http://localhost:1 HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    JELLYFIN_URL=http://localhost:1 HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
@@ -125,6 +171,7 @@ Run these from the repo root, one step at a time.
    ```bash
    DOCKER_HOST=unix:///nonexistent.sock HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    DOCKER_HOST=unix:///nonexistent.sock HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
@@ -135,10 +182,14 @@ Run these from the repo root, one step at a time.
    ```
 
    Wait a minute; "TEST: *host* is unreachable" arrives. Then check in, which sends "back online" and
-   schedules another test alert, and cancel that one **immediately** (within 30 seconds):
+   schedules another test alert. Cancel that one **5 to 25 seconds later**: ntfy.sh ignores a cancel that
+   arrives in the same second as the message it cancels, and the test alert goes out after 30.
 
    ```bash
    HEARTBEAT_GRACE=30s python3 monitoring/stack_watch.py check --test
+   ```
+
+   ```bash
    python3 monitoring/stack_watch.py disarm --test
    ```
 
@@ -146,6 +197,14 @@ Run these from the repo root, one step at a time.
 
    ```bash
    STALL_DAYS=0 python3 monitoring/stack_watch.py stalled --test
+   ```
+
+6. **The watch failing**, with a setting it rejects, twice, then a clean run for "working again":
+
+   ```bash
+   HEARTBEAT_GRACE=never python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=never python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
 To see what the topic received, poll the cache with
@@ -158,5 +217,9 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   has stalled at 0 B/s. SABnzbd's failure alert and the *arrs' "manual interaction required" alert cover a
   download that fails or can't be imported, but not one that never finishes.
 - **ntfy.sh itself.** Every alert here, and the offline alert especially, depends on ntfy.sh being up.
+  Anyone who knows the topic can also cancel the scheduled heartbeat, since its sequence ID is predictable.
+- **A full disk, as such.** If the script can't save its state it sends nothing, rather than repeating
+  itself every run; the scheduled "unreachable" then goes out once the grace has passed. SABnzbd and the
+  *arrs report low disk space themselves.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
