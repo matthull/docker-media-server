@@ -51,7 +51,7 @@ class FakeHttp:
 
     def published(self):
         return [json.loads(data) for method, url, _, data in self.calls
-                if url.startswith("https://ntfy.test")]
+                if method == "POST" and url.startswith("https://ntfy.test")]
 
 
 def paged(records):
@@ -134,15 +134,38 @@ class StalledEpisodesTest(unittest.TestCase):
         self.assertEqual([(s.key, s.group, s.detail) for s in result], [("sonarr:2", "Show", "S01E02")])
 
 
+class UndatedRecordTest(unittest.TestCase):
+    def test_movie_with_no_dates_is_skipped_not_fatal(self):
+        undated = movie(id=7, added=None, releaseDate=None)
+        self.assertEqual([s.key for s in sw.stalled_movies([undated, movie(id=8)], set(), NOW, 3)],
+                         ["radarr:8"])
+
+
 class DigestTest(unittest.TestCase):
     item = sw.Stalled("radarr:1", "Film (2024)", "", NOW - timedelta(days=10))
 
+    @staticmethod
+    def notified(ago, sent=1):
+        return {"radarr:1": {"at": (NOW - ago).isoformat(), "sent": sent}}
+
     def test_due_for_new_items_and_reminders(self):
-        self.assertTrue(sw.digest_due([self.item], {}, NOW, 7))
-        recent = {"radarr:1": (NOW - timedelta(days=7) + timedelta(seconds=1)).isoformat()}
-        self.assertFalse(sw.digest_due([self.item], recent, NOW, 7))
-        old = {"radarr:1": (NOW - timedelta(days=7)).isoformat()}
-        self.assertTrue(sw.digest_due([self.item], old, NOW, 7))
+        self.assertTrue(sw.digest_due([self.item], {}, NOW, 7, 2))
+        recent = self.notified(timedelta(days=7) - timedelta(seconds=1))
+        self.assertFalse(sw.digest_due([self.item], recent, NOW, 7, 2))
+        self.assertTrue(sw.digest_due([self.item], self.notified(timedelta(days=7)), NOW, 7, 2))
+
+    def test_reminders_stop_after_the_cap(self):
+        self.assertTrue(sw.digest_due([self.item], self.notified(timedelta(days=7), sent=2), NOW, 7, 2))
+        self.assertFalse(sw.digest_due([self.item], self.notified(timedelta(days=70), sent=3), NOW, 7, 2))
+
+    def test_long_digest_fits_in_one_ntfy_message(self):
+        items = [sw.Stalled(f"radarr:{n}", f"A film with quite a long title, number {n:03d}", "",
+                            NOW - timedelta(days=5)) for n in range(200)]
+        title, message = sw.format_digest(items, {}, 3)
+        self.assertEqual(title, "200 wanted titles not downloaded after 3 days")
+        self.assertLessEqual(len(message.encode()), sw.MAX_MESSAGE_BYTES)
+        self.assertRegex(message, r"\n… and \d+ more\n")
+        self.assertTrue(message.endswith("Unmonitor a title there to stop hearing about it."))
 
     def test_format_groups_episodes_and_marks_new(self):
         since = NOW - timedelta(days=4)
@@ -247,6 +270,27 @@ class RunStalledTest(unittest.TestCase):
         sent = self.run_once(state, [movie()], queue=[1])
         self.assertNotIn("Film", sent[0]["message"])
 
+    def test_two_reminders_then_quiet_until_a_new_title_arrives(self):
+        state = {}
+        counts = [len(self.run_once(state, [movie()], now=NOW + timedelta(days=d)))
+                  for d in (0, 7, 14, 21, 28)]
+        self.assertEqual(counts, [1, 1, 1, 0, 0])
+        again = self.run_once(state, [movie(), movie(id=2, title="Other")], now=NOW + timedelta(days=29))
+        self.assertEqual(len(again), 1)
+        self.assertIn("Film (2024)", again[0]["message"])
+
+    def test_disarm_cancels_the_heartbeat_and_forgets_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"STACK_DIR": d, "STATE_DIR": d, "NTFY_TOPIC": "t", "NTFY_SERVER": "https://ntfy.test",
+                   "WATCH_HOSTNAME": "zen box"}
+            Path(d, "check-test.json").write_text(json.dumps(
+                {"heartbeat": {"armed": NOW.isoformat(), "last": NOW.isoformat()}, "tracked": {}}))
+            http = FakeHttp()
+            self.assertEqual(sw.main(["disarm", "--test"], env, http, None, NOW), 0)
+            self.assertEqual(sw.load_json(Path(d, "check-test.json")), {"tracked": {}})
+        self.assertEqual([(m, u) for m, u, _, _ in http.calls],
+                         [("DELETE", "https://ntfy.test/t/zen-box-test-heartbeat")])
+
 
 def container(service, status="running", health=None, exit_code=0, oneoff=False):
     state = {"Status": status, "ExitCode": exit_code}
@@ -292,19 +336,34 @@ class JellyfinTest(unittest.TestCase):
 
 class AdvanceTest(unittest.TestCase):
     def test_debounce_alert_steady_and_recovery(self):
-        tracked, changed, worsened = sw.advance({}, {"a": "a: exited"})
+        at = lambda minutes: NOW + timedelta(minutes=minutes)  # noqa: E731
+        tracked, changed, worsened = sw.advance({}, {"a": "a: exited"}, at(0))
         self.assertEqual((changed, worsened, tracked["a"]["alerted"]), (False, False, False))
-        tracked, changed, worsened = sw.advance(tracked, {"a": "a: exited"})
+        tracked, changed, worsened = sw.advance(tracked, {"a": "a: exited"}, at(15))
         self.assertEqual((changed, worsened, tracked["a"]["alerted"]), (True, True, True))
-        tracked, changed, worsened = sw.advance(tracked, {"a": "a: exited"})
+        tracked, changed, worsened = sw.advance(tracked, {"a": "a: exited"}, at(30))
         self.assertEqual((changed, worsened), (False, False))
-        tracked, changed, worsened = sw.advance(tracked, {})
+        tracked, changed, worsened = sw.advance(tracked, {}, at(45))
         self.assertEqual((tracked, changed, worsened), ({}, True, False))
 
     def test_blip_that_clears_before_threshold_is_silent(self):
-        tracked, _, _ = sw.advance({}, {"a": "x"})
-        tracked, changed, _ = sw.advance(tracked, {})
+        tracked, _, _ = sw.advance({}, {"a": "x"}, NOW)
+        tracked, changed, _ = sw.advance(tracked, {}, NOW + timedelta(minutes=15))
         self.assertEqual((tracked, changed), ({}, False))
+
+    def test_sighting_before_a_gap_does_not_count(self):
+        """The run before a suspend and the run after resume are not consecutive."""
+        tracked, _, _ = sw.advance({}, {"a": "x"}, NOW)
+        later = NOW + sw.STALE_AFTER + timedelta(seconds=1)
+        tracked, changed, _ = sw.advance(tracked, {"a": "x"}, later)
+        self.assertEqual((changed, tracked["a"]["count"], tracked["a"]["alerted"]), (False, 1, False))
+        tracked, changed, _ = sw.advance(tracked, {"a": "x"}, later + sw.STALE_AFTER)
+        self.assertEqual((changed, tracked["a"]["alerted"]), (True, True))
+
+    def test_alerted_problem_stays_alerted_across_a_gap(self):
+        tracked = {"a": {"count": 2, "alerted": True, "description": "x", "seen": NOW.isoformat()}}
+        tracked, changed, _ = sw.advance(tracked, {"a": "x"}, NOW + timedelta(hours=10))
+        self.assertEqual((changed, tracked["a"]["alerted"]), (False, True))
 
     def test_format(self):
         tracked = {"b": {"alerted": True, "description": "b: x"}, "a": {"alerted": True, "description": "a: y"},
@@ -318,40 +377,72 @@ class AdvanceTest(unittest.TestCase):
 
 class HeartbeatTest(unittest.TestCase):
     def send(self, grace, previous, now=NOW):
-        http = FakeHttp()
-        notifier = sw.Notifier("https://ntfy.test", "topic", http)
+        self.http = FakeHttp()
+        notifier = sw.Notifier("https://ntfy.test", "topic", self.http)
         new = sw.heartbeat({"HEARTBEAT_GRACE": grace}, notifier, previous, now, "zen", "zen")
-        return new, http.published()
+        return new, self.http.published()
+
+    @staticmethod
+    def armed(ago, last_ago=None):
+        return {"armed": (NOW - ago).isoformat(),
+                "last": (NOW - (ago if last_ago is None else last_ago)).isoformat()}
 
     def test_schedules_replaceable_alert(self):
         new, sent = self.send("24h", {})
-        self.assertEqual(new, {"last": NOW.isoformat()})
+        self.assertEqual(new, {"last": NOW.isoformat(), "armed": NOW.isoformat()})
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["sequence_id"], "zen-heartbeat")
         self.assertEqual(sent[0]["delay"], str(int((NOW + timedelta(hours=24)).timestamp())))
         self.assertEqual((sent[0]["title"], sent[0]["priority"]), ("zen is unreachable", 4))
 
-    def test_recovery_only_after_gap_longer_than_grace(self):
-        at_grace = {"last": (NOW - timedelta(hours=24)).isoformat()}
-        self.assertEqual(len(self.send("24h", at_grace)[1]), 1)
-        past_grace = {"last": (NOW - timedelta(hours=24, seconds=1)).isoformat()}
-        _, sent = self.send("24h", past_grace)
+    def test_blank_grace_means_default_not_off(self):
+        _, sent = self.send("", {})
+        self.assertEqual(sent[0]["delay"], str(int((NOW + timedelta(hours=24)).timestamp())))
+
+    def test_rearms_at_most_hourly_for_long_grace(self):
+        new, sent = self.send("24h", self.armed(timedelta(minutes=59)))
+        self.assertEqual(sent, [])
+        self.assertEqual(new, {"last": NOW.isoformat(),
+                               "armed": (NOW - timedelta(minutes=59)).isoformat()})
+        new, sent = self.send("24h", self.armed(timedelta(hours=1)))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(new["armed"], NOW.isoformat())
+
+    def test_short_grace_rearms_every_run(self):
+        _, sent = self.send("30s", self.armed(timedelta(seconds=2)))
+        self.assertEqual(len(sent), 1)
+
+    def test_recovery_only_after_armed_alert_fired(self):
+        self.assertEqual(len(self.send("24h", self.armed(timedelta(hours=24)))[1]), 1)
+        _, sent = self.send("24h", self.armed(timedelta(hours=24, seconds=1), timedelta(hours=23)))
         self.assertEqual([m["title"] for m in sent], ["zen is back online", "zen is unreachable"])
         self.assertNotIn("delay", sent[0])
         self.assertEqual(sent[0]["sequence_id"], "zen-heartbeat")
+        self.assertIn(sw.when(NOW - timedelta(hours=23)), sent[0]["message"])
 
-    def test_off_and_limits(self):
-        self.assertEqual(self.send("off", {"last": "x"}), ({}, []))
+    def test_off_cancels_an_armed_alert(self):
+        self.assertEqual(self.send("off", self.armed(timedelta(minutes=5))), ({}, []))
+        self.assertEqual([(m, u) for m, u, _, _ in self.http.calls],
+                         [("DELETE", "https://ntfy.test/topic/zen-heartbeat")])
+        self.assertEqual(self.send("off", {}), ({}, []))
+        self.assertEqual(self.http.calls, [])
+
+    def test_limits(self):
         for grace in ("9s", "4d"):
             with self.assertRaises(ValueError):
                 self.send(grace, {})
 
 
+COMPOSE_CONFIG = json.dumps({"name": "proj", "services": {"sonarr": {}, "radarr": {}}})
+
+
 class RunCheckTest(unittest.TestCase):
     def test_docker_down_alerts_after_two_runs_heartbeat_every_run(self):
         def docker_down(argv):
+            if argv[1] == "compose":
+                return COMPOSE_CONFIG  # parsing the compose file needs no daemon
             raise RuntimeError("Cannot connect to the Docker daemon")
-        cfg = {"STACK_DIR": "/stack", "JELLYFIN_URL": "http://jf", "HEARTBEAT_GRACE": "1h"}
+        cfg = {"STACK_DIR": "/stack", "JELLYFIN_URL": "http://jf", "HEARTBEAT_GRACE": "30s"}
         state, runs = {}, []
         for minutes in (0, 15):
             http = FakeHttp({"/health": "Healthy"})
@@ -359,27 +450,42 @@ class RunCheckTest(unittest.TestCase):
             sw.run_check(cfg, notifier, state, NOW + timedelta(minutes=minutes), http, docker_down, "h", "h")
             runs.append(http.published())
         self.assertEqual([m["title"] for m in runs[0]], ["h is unreachable"])
-        self.assertEqual([m["title"] for m in runs[1]], ["Media stack on h: 1 problem", "h is unreachable"])
+        self.assertEqual([m["title"] for m in runs[1]],
+                         ["Media stack on h: 1 problem", "h is back online", "h is unreachable"])
         self.assertEqual(runs[1][0]["sequence_id"], "h-stack")
-        self.assertIn("docker: not responding (Cannot connect to the Docker daemon)", runs[1][0]["message"])
+        self.assertIn("• docker: not responding", runs[1][0]["message"])
+        self.assertNotIn("Cannot connect", runs[1][0]["message"])  # stderr stays in the journal
 
-    def test_compose_state_feeds_container_problems(self):
-        outputs = {"config": json.dumps({"name": "proj", "services": {"sonarr": {}, "radarr": {}}}),
-                   "ps": "abc\ndef\n",
+    def test_stack_problems_reads_the_compose_projects_containers(self):
+        outputs = {"config": COMPOSE_CONFIG, "ps": "abc\ndef\n",
                    "inspect": json.dumps([container("sonarr"), container("radarr", "exited", exit_code=1)])}
         seen = []
 
         def run(argv):
             seen.append(argv)
             return outputs[argv[1] if argv[1] != "compose" else "config"]
-        services, containers = sw.compose_state(Path("/stack"), run)
-        self.assertEqual(services, ["radarr", "sonarr"])
+        self.assertEqual(sw.stack_problems(Path("/stack"), run),
+                         {"service:radarr": "radarr: exited (code 1)"})
         self.assertIn("label=com.docker.compose.project=proj", seen[1])
         self.assertEqual(seen[2], ["docker", "inspect", "abc", "def"])
-        self.assertEqual(sw.container_problems(services, containers), {"service:radarr": "radarr: exited (code 1)"})
+
+    def test_unreadable_compose_config_is_labelled_without_leaking_stderr(self):
+        """Compose quotes .env values in its errors; those must never reach the public topic."""
+        def bad_config(argv):
+            raise RuntimeError("/stack/.env: line 3: unterminated quoted value 'SENTINEL_SECRET")
+        problems = sw.stack_problems(Path("/stack"), bad_config)
+        self.assertEqual(problems, {"compose": "compose: can't read the stack config (details in the journal)"})
+
+    def test_blank_jellyfin_url_means_default(self):
+        http = FakeHttp({"/health": "Healthy"})
+        notifier = sw.Notifier("https://ntfy.test", "topic", http)
+        cfg = {"STACK_DIR": "/s", "JELLYFIN_URL": "", "HEARTBEAT_GRACE": "off"}
+        sw.run_check(cfg, notifier, {}, NOW, http, lambda argv: COMPOSE_CONFIG if argv[1] == "compose" else "", "h", "h")
+        self.assertIn("http://localhost:8096/health", [url for _, url, _, _ in http.calls])
 
     def test_failed_send_does_not_advance_state(self):
-        state = {"tracked": {"jellyfin": {"count": 1, "alerted": False, "description": "x"}}}
+        state = {"tracked": {"jellyfin": {"count": 1, "alerted": False, "description": "x",
+                                          "seen": (NOW - timedelta(minutes=15)).isoformat()}}}
 
         def http(method, url, headers=None, data=None, timeout=20):
             if "/health" in url:
@@ -416,7 +522,8 @@ class MainTest(unittest.TestCase):
         failing = broken.published()
         self.assertEqual([m["title"] for m in failing], ["Stack watch on zen box is failing"])
         self.assertEqual(failing[0]["sequence_id"], "zen-box-watch-stalled")
-        self.assertIn("failed 2 runs in a row", failing[0]["message"])
+        self.assertIn("failed 2 runs in a row: URLError", failing[0]["message"])
+        self.assertNotIn("refused", failing[0]["message"])  # exception text stays in the journal
 
         fixed = FakeHttp({"/api/v3/": paged([])})
         self.assertEqual(sw.main(["stalled"], self.env, fixed, None, NOW + timedelta(days=3)), 0)
