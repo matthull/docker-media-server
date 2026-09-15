@@ -243,6 +243,19 @@ Run these from the repo root, one step at a time.
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
+Two checks that a green test suite can't give you, both run from the repo root and both harmless
+(neither touches the repo, and neither sends anything):
+
+```bash
+python3 monitoring/mutation_table.py   # breaks one behaviour at a time; a SURVIVOR is untested
+python3 monitoring/simulate_disk.py    # how many ntfy messages a filling or wobbling drive costs
+```
+
+`mutation_table.py` is worth running after changing `stack_watch.py`: a passing suite shows the tests
+ran, not that they'd notice a regression. It has caught real gaps here — a blank `DISK_FREE_MIN`
+(what `.env.example` ships) silently turning the disk check off, among others. Add an entry when you
+add behaviour worth keeping.
+
 To see what the topic received, poll the cache with
 `curl -s "https://ntfy.sh/<topic>/json?poll=1&since=10m"`.
 Add `&scheduled=1` to also list messages still waiting to be sent.
