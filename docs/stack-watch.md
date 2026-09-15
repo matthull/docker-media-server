@@ -106,7 +106,7 @@ checks.
    | -------- | ------- | ------- |
    | `NTFY_TOPIC` | required | Topic to publish to |
    | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `30m` to `71h`, or `off` |
-   | `DISK_FREE_MIN` | `100G` | Free space below which the drive is a problem: `1G`+ as `M`/`G`/`T`, or `off` |
+   | `DISK_FREE_MIN` | `100G` | Free space below which the drive is a problem: `1G` or more, as `G`/`T`, or `off` |
    | `STALL_DAYS` | `3` | Days a wanted title may wait before the digest lists it |
    | `STALL_REMIND_DAYS` | `7` | Days between reminders about the same titles |
    | `JELLYFIN_URL` | `http://localhost:8096` | Jellyfin from this host, or `off` |
@@ -116,8 +116,10 @@ checks.
    | `STATE_DIR` | `~/.local/state/media-stack-watch` | Where the script keeps its state |
 
    **`DISK_FREE_MIN` is an amount, not a percentage**, because what it has to protect is an amount.
-   SABnzbd stops downloading at its own `download_free` (50G in this stack) and says nothing anyone sees, so
-   the alert has to come far enough above that to leave room to act. At this stack's 1080p WEB
+   SABnzbd stops downloading when its **temp** folder's filesystem reaches its own `download_free`
+   (50G in this stack) and says nothing anyone sees, so the alert has to come far enough above that to
+   leave room to act. On this host `SABNZBD_TEMP` and `MEDIA_ROOT` are the same drive, so one number
+   covers both; if you put temp on its own disk, that is the one `download_free` governs. At this stack's 1080p WEB
    profile a film measures 3–9G and a season 10–27G, so the default `100G` is SABnzbd's floor plus
    the largest season plus slack — and it still means that on a larger drive, where the same
    percentage would be tens of titles of false headroom. `G` is 2^30 bytes, as in `df -h`.
@@ -259,7 +261,7 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
 - **A filesystem the stack writes to that is neither `MEDIA_ROOT` nor `SABNZBD_TEMP`**, such as a
   `CONFIG_ROOT` on its own drive.
 - **A drive that failed to mount.** An unmounted mount point is an ordinary empty directory, so the
-  disk check reports the filesystem underneath it and sees plenty of room. Worth knowing when
-  `MEDIA_ROOT` moves onto its own drive; the *arrs will complain about the missing library first.
+  disk check reports the filesystem underneath it and sees plenty of room, and nothing here says
+  otherwise. Worth knowing when `MEDIA_ROOT` moves onto its own drive.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.

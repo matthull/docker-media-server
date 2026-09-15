@@ -659,11 +659,21 @@ class PublishStackTest(unittest.TestCase):
                            ["white_check_mark"])])
         self.assertEqual(new["shown"], {})
 
-    def test_changed_description_updates_at_default_priority(self):
+    def test_a_changed_description_counts_as_worse(self):
+        """This used to go out at Default: a description change was not counted as worsening. Every
+        description moves between bad states — restarting to exited, a disk step down — never towards
+        good, and since the disk check ratchets, a changed description is its only escalation."""
         stack = {"shown": {"a": "a: restarting", "b": "b: unhealthy"}, "sent": []}
         _, sent = self.publish({"a": "a: exited (code 1)", "b": "b: unhealthy"}, stack)
-        self.assertEqual([(m["title"], m["message"], m["priority"]) for m in sent],
-                         [("Media stack on h: 2 problems", "• a: exited (code 1)\n• b: unhealthy", 3)])
+        self.assertEqual([(m["title"], m["message"], m["priority"], m["tags"]) for m in sent],
+                         [("Media stack on h: 2 problems", "• a: exited (code 1)\n• b: unhealthy",
+                           sw.HIGH, ["rotating_light"])])
+
+    def test_a_problem_clearing_is_still_not_worse(self):
+        """Only a new key or a changed one; losing a key on its own stays at Default."""
+        stack = {"shown": {"a": "a: exited (code 1)", "b": "b: unhealthy"}, "sent": []}
+        _, sent = self.publish({"a": "a: exited (code 1)"}, stack)
+        self.assertEqual([(m["priority"], m["tags"]) for m in sent], [(sw.DEFAULT, ["white_check_mark"])])
 
     def test_daily_cap_mutes_updates_until_a_day_after_the_oldest(self):
         times = [NOW - 23 * HOUR + n * MIN for n in range(11)] + [NOW - 25 * HOUR]
@@ -814,10 +824,10 @@ class HeartbeatTest(unittest.TestCase):
 
 
 class RunCheckTest(unittest.TestCase):
-    def check(self, state, run, at, cfg=None, http=None):
+    def check(self, state, run, at, cfg=None, http=None, timing=sw.REAL_TIMING):
         http = FakeHttp({"/health": "Healthy"}) if http is None else http
         cfg = {"STACK_DIR": "/stack", "JELLYFIN_URL": "http://jf", "HEARTBEAT_GRACE": "off"} | (cfg or {})
-        sw.run_check(make_watch(cfg, http, run, NOW + at), state)
+        sw.run_check(make_watch(cfg, http, run, NOW + at, timing), state)
         return http.published()
 
     def test_docker_down_alerts_on_the_second_run_without_leaking_stderr(self):
@@ -883,14 +893,33 @@ class RunCheckTest(unittest.TestCase):
         self.assertEqual(problems, {"compose": "compose: can't read the stack config (details in the journal)"})
 
     def test_disk_is_watched_alongside_the_containers(self):
-        """A threshold above any real drive, so the check reports the filesystem it is run on."""
-        state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "1024T"}
+        """The path is a sentinel, so the leak assertion can actually fail: the topic is public and
+        the real paths name the user's home directory."""
+        state = {}
+        cfg = {"MEDIA_ROOT": "/SENTINEL_HOME/media", "DISK_FREE_MIN": "100G"}
         healthy = docker(container("sonarr"), container("radarr"))
-        self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
-        [sent] = self.check(state, healthy, 15 * MIN, cfg)
+        with mounted(Drive(30 * GB)):
+            self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
+            [sent] = self.check(state, healthy, 15 * MIN, cfg)
         self.assertEqual(sent["title"], "Media stack on h: 1 problem")
-        self.assertRegex(sent["message"], r"^• disk: dropped below [\d.]+[MGT] free for the library$")
-        self.assertNotIn("/", sent["message"])  # the path names the user's home; the topic is public
+        self.assertEqual(sent["message"], "• disk: dropped below 50G free for the library")
+        self.assertNotIn("SENTINEL", json.dumps(sent))
+
+    def test_a_worsening_step_is_not_dressed_as_good_news(self):
+        """The ratchet made a changed description the disk's escalation path, and publish_stack only
+        counted new keys as worse: "dropped below 25G" went out at Default with a white_check_mark."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        drive, sent = Drive(60 * GB), []
+        with mounted(drive):
+            for minutes in (0, 15):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            drive.free = 20 * GB
+            for minutes in (30, 45):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+        self.assertEqual([(m["message"], m["priority"], m["tags"]) for m in sent], [
+            ("• disk: dropped below 100G free for the library", sw.HIGH, ["rotating_light"]),
+            ("• disk: dropped below 25G free for the library", sw.HIGH, ["rotating_light"])])
 
     def test_a_drive_wobbling_across_a_step_does_not_burn_the_daily_cap(self):
         """SABnzbd pauses at its own floor and resumes when space returns, so free space oscillates

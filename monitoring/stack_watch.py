@@ -144,7 +144,9 @@ def parse_size(text: str) -> int:
 
 
 def size(nbytes: float) -> str:
-    """The largest whole unit, in parse_size's format."""
+    """The largest whole unit, in parse_size's format, or plain bytes below a megabyte (which
+    DISK_FREE_MIN's 1G floor and DISK_STEPS put out of reach, but which is not parse_size's format
+    and is not meant to be fed back to it)."""
     for unit, scale in (("T", SIZE_UNITS["T"]), ("G", SIZE_UNITS["G"]), ("M", SIZE_UNITS["M"])):
         if nbytes >= scale:
             return f"{nbytes / scale:.10g}{unit}"
@@ -154,9 +156,9 @@ def size(nbytes: float) -> str:
 def span(delta: timedelta) -> str:
     """The largest whole unit, in parse_duration's format."""
     seconds = int(delta.total_seconds())
-    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
-        if seconds >= size and seconds % size == 0:
-            return f"{seconds // size}{unit}"
+    for unit, scale in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= scale and seconds % scale == 0:
+            return f"{seconds // scale}{unit}"
     return f"{seconds}s"
 
 
@@ -647,7 +649,11 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     sent = sorted(t for t in map(parse_ts, stack.get("sent", [])) if now - t < day)
     reported = {k: t for k, t in ((k, parse_ts(v)) for k, v in stack.get("reported", {}).items())
                 if now - t < day}
-    worsened = bool(current.keys() - shown.keys())
+    # A new problem is worse, and so is one whose description changed: every description here moves
+    # between bad states (restarting -> exited, a disk step down), never towards good. Without this a
+    # disk step worsening — the ratchet's whole escalation path — went out with a white_check_mark.
+    worsened = bool(current.keys() - shown.keys()) or any(
+        current[key] != shown[key] for key in current.keys() & shown.keys())
     # A problem not reported in the last day goes out even when muted; a flapping one doesn't.
     fresh = bool(current.keys() - shown.keys() - reported.keys())
     if not worsened and sent and now - sent[-1] < watch.timing.stack_gap:
