@@ -456,10 +456,30 @@ GB = 1024 ** 3
 DISK_CFG = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl"}
 
 
+class Drive:
+    """A fake filesystem_free for one filesystem whose free space the test moves between checks."""
+
+    def __init__(self, free):
+        self.free = free
+
+    def __call__(self, path):
+        return 1, self.free
+
+
+@contextlib.contextmanager
+def mounted(drive):
+    original = sw.filesystem_free
+    sw.filesystem_free = drive
+    try:
+        yield drive
+    finally:
+        sw.filesystem_free = original
+
+
 class DiskTest(unittest.TestCase):
-    def problems(self, minimum, library, downloads):
+    def problems(self, minimum, library, downloads, floors=None):
         reader = free_space(("/lib", library), ("/dl", downloads))
-        return sw.disk_problems(DISK_CFG, minimum, reader)
+        return sw.disk_problems(DISK_CFG, minimum, {} if floors is None else floors, reader)
 
     def test_quiet_while_there_is_room(self):
         self.assertEqual(self.problems(100 * GB, (1, 143 * GB), (1, 143 * GB)), {})
@@ -467,19 +487,20 @@ class DiskTest(unittest.TestCase):
 
     def test_paths_that_share_a_filesystem_are_one_problem(self):
         self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (1, 30 * GB)),
-                         {"disk:library+downloads": "disk: under 50G free for the library and downloads"})
+                         {"disk:library+downloads":
+                          "disk: dropped below 50G free for the library and downloads"})
 
     def test_separate_filesystems_are_reported_separately(self):
         self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (2, 500 * GB)),
-                         {"disk:library": "disk: under 50G free for the library"})
+                         {"disk:library": "disk: dropped below 50G free for the library"})
         self.assertEqual(self.problems(100 * GB, (1, 500 * GB), (2, 5 * GB)),
-                         {"disk:downloads": "disk: under 10G free for the downloads"})
+                         {"disk:downloads": "disk: dropped below 10G free for the downloads"})
 
     def test_it_reports_the_lowest_step_it_is_under(self):
         """The exact figure would differ on nearly every run, and republish the stack notification
         every hour as downloads nudged it. A step only changes when crossing one, which is news."""
         under = {free: self.problems(100 * GB, (1, free), (1, free))["disk:library+downloads"]
-                 .removeprefix("disk: under ").removesuffix(" free for the library and downloads")
+                 .removeprefix("disk: dropped below ").removesuffix(" free for the library and downloads")
                  for free in (99 * GB, 50 * GB, 50 * GB - 1, 25 * GB, 25 * GB - 1,
                               10 * GB, 10 * GB - 1, 0)}
         self.assertEqual(list(under.values()),
@@ -488,25 +509,25 @@ class DiskTest(unittest.TestCase):
     def test_the_lowest_step_is_a_floor_not_a_promise_of_more(self):
         """Under the smallest step there is nothing smaller to report, so the text stops changing."""
         self.assertEqual(self.problems(100 * GB, (1, 1), (1, 1))["disk:library+downloads"],
-                         "disk: under 10G free for the library and downloads")
+                         "disk: dropped below 10G free for the library and downloads")
 
     def test_a_path_that_is_not_set_is_not_checked(self):
         reader = free_space(("/dl", (1, 5 * GB)))
-        self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": "/dl"}, 100 * GB, reader),
-                         {"disk:downloads": "disk: under 10G free for the downloads"})
-        self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "  "}, 100 * GB, reader), {})
+        self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": "/dl"}, 100 * GB, {}, reader),
+                         {"disk:downloads": "disk: dropped below 10G free for the downloads"})
+        self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "  "}, 100 * GB, {}, reader), {})
 
     def test_an_unreadable_path_is_reported_not_raised(self):
         reader = free_space(("/dl", (1, 500 * GB)))
         with contextlib.redirect_stderr(io.StringIO()):
-            problems = sw.disk_problems(DISK_CFG, 100 * GB, reader)
+            problems = sw.disk_problems(DISK_CFG, 100 * GB, {}, reader)
         self.assertEqual(problems, {"disk:library": "disk: can't read free space for the library path"})
 
     def test_an_unreadable_path_never_carries_the_os_error_text(self):
         def reader(path):
             raise OSError(13, "SENTINEL_SECRET")
         with contextlib.redirect_stderr(io.StringIO()):
-            problems = sw.disk_problems(DISK_CFG, 100 * GB, reader)
+            problems = sw.disk_problems(DISK_CFG, 100 * GB, {}, reader)
         self.assertNotIn("SENTINEL", json.dumps(problems))
 
     def test_bad_setting_is_rejected_in_words_the_script_wrote(self):
@@ -524,6 +545,29 @@ class DiskTest(unittest.TestCase):
         self.assertEqual(sw.disk_minimum({"DISK_FREE_MIN": "   "}), sw.parse_size("100G"))
         for off in ("off", "OFF", "Off", " off "):
             self.assertIsNone(sw.disk_minimum({"DISK_FREE_MIN": off}), off)
+
+    def test_the_report_only_ever_ratchets_down(self):
+        """Free space crossing back up over a step must not change the text: the claim is about the
+        low point reached, not the moment, so coming back up doesn't falsify it and nothing is
+        republished. Without this a wobble across a step burns the daily cap on alternation."""
+        floors = {}
+
+        def level(free):
+            return (self.problems(100 * GB, (1, free), (1, free), floors)["disk:library+downloads"]
+                    .removeprefix("disk: dropped below ").split(" free")[0])
+        self.assertEqual([level(free) for free in
+                          (60 * GB, 49 * GB, 60 * GB, 99 * GB, 20 * GB, 60 * GB, 5 * GB, 99 * GB)],
+                         ["100G", "50G", "50G", "50G", "25G", "25G", "10G", "10G"])
+        self.assertEqual(floors, {"disk:library+downloads": 10 * GB})
+
+    def test_retuning_the_threshold_never_claims_a_level_the_drive_was_not_under(self):
+        """The floor is a level in bytes, not a fraction, so lowering DISK_FREE_MIN mid-problem
+        cannot rescale it into a claim that was never true."""
+        floors = {}
+        self.problems(100 * GB, (1, 49 * GB), (1, 49 * GB), floors)
+        self.assertEqual(floors, {"disk:library+downloads": 50 * GB})
+        text = self.problems(60 * GB, (1, 45 * GB), (1, 45 * GB), floors)["disk:library+downloads"]
+        self.assertEqual(text, "disk: dropped below 50G free for the library and downloads")
 
     def test_the_default_leaves_room_to_act_above_sabnzbds_own_floor(self):
         """SABnzbd pauses at download_free (50G as shipped) without telling anyone why. The default
@@ -845,8 +889,50 @@ class RunCheckTest(unittest.TestCase):
         self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
         [sent] = self.check(state, healthy, 15 * MIN, cfg)
         self.assertEqual(sent["title"], "Media stack on h: 1 problem")
-        self.assertRegex(sent["message"], r"^• disk: under [\d.]+[MGT] free for the library$")
+        self.assertRegex(sent["message"], r"^• disk: dropped below [\d.]+[MGT] free for the library$")
         self.assertNotIn("/", sent["message"])  # the path names the user's home; the topic is public
+
+    def test_a_drive_wobbling_across_a_step_does_not_burn_the_daily_cap(self):
+        """SABnzbd pauses at its own floor and resumes when space returns, so free space oscillates
+        around exactly the kind of number a step sits on. Undamped that sent 10 alternating updates
+        in 11.5 hours and left almost nothing of STACK_DAILY_CAP for the fall that followed."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        drive, sent = Drive(52 * GB), []
+        with mounted(drive):
+            for minutes in range(0, 12 * 60, 15):
+                drive.free = (52 if (minutes // 15) % 2 else 48) * GB
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            # 48 checks over 12 hours; undamped this alternated 10 times.
+            self.assertEqual([m["message"] for m in sent],
+                             ["• disk: dropped below 50G free for the library"])
+            # ...and the fall that follows is still heard, because the cap was not spent on noise.
+            for index, free in enumerate(range(48, -1, -3)):
+                drive.free = free * GB
+                sent += self.check(state, healthy, (12 * 60 + index * 15) * MIN, cfg)
+        self.assertEqual([m["message"] for m in sent],
+                         ["• disk: dropped below 50G free for the library",
+                          "• disk: dropped below 25G free for the library",
+                          "• disk: dropped below 10G free for the library"])
+
+    def test_the_floor_is_released_once_the_drive_recovers(self):
+        """Otherwise the next time it dipped it would still claim the old low point."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        drive = Drive(20 * GB)
+        with mounted(drive):
+            for minutes in (0, 15):
+                self.check(state, healthy, minutes * MIN, cfg)
+            self.assertEqual(state["disk"], {"disk:library": 25 * GB})
+            drive.free = 500 * GB
+            for minutes in (30, 45, 60):
+                self.check(state, healthy, minutes * MIN, cfg)
+            self.assertEqual(state["disk"], {})
+            drive.free = 90 * GB
+            for minutes in (75, 90):
+                sent = self.check(state, healthy, minutes * MIN, cfg)
+        self.assertEqual([m["message"] for m in sent],
+                         ["• disk: dropped below 100G free for the library"])
 
     def test_disk_check_is_off_by_the_setting(self):
         state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "off"}

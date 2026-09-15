@@ -68,11 +68,15 @@ DISK_ROLES = (("MEDIA_ROOT", "library"), ("SABNZBD_TEMP", "downloads"))
 # was 3.4G) and a season is 10-27G. 100G leaves SABnzbd's floor plus the largest season plus room to
 # act, and unlike a percentage it still means that on a bigger drive after the desktop migration.
 DISK_FREE_MIN_DEFAULT = "100G"
-# What a disk alert reports, as fractions of DISK_FREE_MIN. It reports the step it is under rather
-# than the figure itself, because the figure changes on nearly every run and a changed description
-# republishes the stack notification: measured over a drive losing 2G per check from 200G, that is
-# 12 updates, the whole STACK_DAILY_CAP, so a container dying the same day would be muted. On these
-# steps the same fill costs 4, and each one means it got materially worse.
+# What a disk alert reports, as fractions of DISK_FREE_MIN: the lowest one the drive has been under
+# since the problem began, never the figure itself. advance() damps whether a problem is there, but
+# a description is taken from the latest run undamped, and a changed description republishes the
+# stack notification. Free space is the first thing here that varies continuously, and it wobbles:
+# SABnzbd pausing at its own download_free and resuming when space returns is a mechanism for
+# wobbling it, and with the 100G default the 0.5 step is 50G, the very number it wobbles around.
+# Measured, a +-2G wobble across a step sends 10 alternating updates in 11.5 hours and leaves 2 of
+# STACK_DAILY_CAP for the real fall that follows. Ratcheting fixes that: the report only moves one
+# way, so a monotone fill costs at most len(DISK_STEPS) updates and every one of them is news.
 DISK_STEPS = (1, 0.5, 0.25, 0.1)
 
 Http = Callable[..., str]
@@ -547,11 +551,19 @@ def filesystem_free(path: str) -> tuple[int, int]:
     return os.stat(path).st_dev, stat.f_bavail * stat.f_frsize
 
 
-def disk_problems(cfg: dict, minimum: int, free_space=filesystem_free) -> dict[str, str]:
+def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dict[str, str]:
     """One entry per filesystem behind DISK_ROLES with less than `minimum` free. Paths sharing a
     filesystem share an entry: on a single-drive host that is one alert, not one per role. A path
     that isn't configured isn't checked; one that can't be read is a problem in its own right, and
-    is reported rather than raised, so the container and Jellyfin checks still run."""
+    is reported rather than raised, so the container and Jellyfin checks still run.
+
+    `floors` maps a problem key to the lowest level already reported for it, in bytes, and is
+    updated here; run_check keeps it for as long as the problem lasts. Reporting the low point
+    rather than the moment is what makes the text stable (see DISK_STEPS), and is why it says
+    "dropped below": free space coming back up past a step doesn't make that untrue, so there is
+    nothing to republish. Bytes, not the DISK_STEPS fraction, because retuning DISK_FREE_MIN
+    mid-problem would rescale a fraction into a level the drive was never actually under."""
+    free_space = free_space or filesystem_free
     filesystems: dict[int, tuple[list[str], int]] = {}
     problems = {}
     for key, role in DISK_ROLES:
@@ -569,12 +581,15 @@ def disk_problems(cfg: dict, minimum: int, free_space=filesystem_free) -> dict[s
         if free >= minimum:
             continue
         step = min(fraction for fraction in DISK_STEPS if free < minimum * fraction)
-        problems[f"disk:{'+'.join(roles)}"] = (
-            f"disk: under {size(minimum * step)} free for the {' and '.join(roles)}")
+        key = f"disk:{'+'.join(roles)}"
+        reached = int(minimum * step)
+        level = floors[key] = min(reached, floors.get(key, reached))
+        problems[key] = (
+            f"disk: dropped below {size(level)} free for the {' and '.join(roles)}")
     return problems
 
 
-def gather_problems(watch: Watch) -> dict[str, str]:
+def gather_problems(watch: Watch, floors: dict | None = None) -> dict[str, str]:
     problems = stack_problems(Path(watch.cfg["STACK_DIR"]), watch.run)
     jellyfin_url = watch.cfg.get("JELLYFIN_URL") or "http://localhost:8096"
     if jellyfin_url.strip().lower() != "off":
@@ -583,7 +598,7 @@ def gather_problems(watch: Watch) -> dict[str, str]:
             problems["jellyfin"] = problem
     minimum = disk_minimum(watch.cfg)
     if minimum is not None:
-        problems |= disk_problems(watch.cfg, minimum)
+        problems |= disk_problems(watch.cfg, minimum, floors if floors is not None else {})
     return problems
 
 
@@ -705,8 +720,9 @@ def heartbeat(watch: Watch, state: dict) -> None:
 def run_check(watch: Watch, state: dict) -> None:
     errors = []
     previous = state.get("tracked", {})
+    floors = state.setdefault("disk", {})
     try:
-        problems = gather_problems(watch)
+        problems = gather_problems(watch, floors)
     except Exception as exc:  # still reschedule the heartbeat, or a false "unreachable" goes out
         errors.append(exc)
     else:
@@ -719,6 +735,9 @@ def run_check(watch: Watch, state: dict) -> None:
         state.setdefault("stack", {"shown": {k: v["description"] for k, v in previous.items()
                                              if v.get("alerted")}})
         state["tracked"] = tracked
+        # A floor lives exactly as long as its problem, so one run back above a step doesn't reset
+        # it but a real all clear does. advance() has already applied the absence damping.
+        state["disk"] = {key: level for key, level in floors.items() if key in tracked}
         try:
             state["stack"] = publish_stack(watch, tracked, state["stack"])
         except Exception as exc:

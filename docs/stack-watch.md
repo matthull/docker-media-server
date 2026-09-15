@@ -32,13 +32,18 @@ new account.
   `/health` not saying `Healthy`; less than `DISK_FREE_MIN` free where the library or the downloads
   live; Docker not answering; or a Compose file that can't be read. While Docker isn't answering,
   services keep the state they last had rather than being counted as recovered.
-- **The disk problem** reads the filesystems behind `MEDIA_ROOT` and `SABNZBD_TEMP`. Paths that
-  share a filesystem share one entry (`disk: under 50G free for the library and downloads`); paths
-  on separate drives get one each. It reports the step it is under — `DISK_FREE_MIN`, then half,
-  a quarter and a tenth of it — rather than the figure itself. The figure changes on nearly every
-  run, and a changed description republishes the notification: a drive losing 2G per check from
-  200G costs 12 updates that way, which is the whole daily cap, so a container dying that day would
-  be muted. On the step ladder the same fill costs 4, and each one means it got materially worse.
+- **The disk problem** reads the filesystems behind `MEDIA_ROOT` and `SABNZBD_TEMP`. Paths that share
+  a filesystem share one entry (`disk: dropped below 50G free for the library and downloads`); paths
+  on separate drives get one each. It reports the *lowest* step the drive has been under since the
+  problem began — `DISK_FREE_MIN`, then half, a quarter and a tenth of it — never the figure itself,
+  and never moving back up until the all clear releases it. That is why it says "dropped below": free
+  space rising past a step again doesn't make the sentence untrue, so there is nothing to republish.
+  Without the ratchet there would be. A description is taken from the latest check with no damping,
+  and a changed one republishes the notification, so a drive drifting across a step alternates:
+  measured, a ±2G wobble across the 50G step sent 10 updates in 11.5 hours and left almost none of
+  the daily cap for the fall that followed. SABnzbd pausing at its own `download_free` and resuming
+  when space returns is a mechanism for producing exactly that wobble, around exactly that number.
+  Ratcheted, the same wobble sends one, and the fall afterwards still gets each remaining step.
   Neither path is named: the topic is public and the paths name your home directory.
 - **The problem notification is updated in place**, and so are the heartbeat and "failing" ones (ntfy's
   `sequence_id`), so a problem that lasts a day is one notification that changes. A new problem goes out
