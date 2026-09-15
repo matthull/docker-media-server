@@ -8,9 +8,11 @@ themselves:
 - Jellyfin not answering, since it runs outside the stack;
 - the host asleep, powered off or offline, since nothing on it can send anything;
 - a request Sonarr or Radarr accepted and then waits on forever, because no release ever turns up.
-  Seerr has no event for this, so it just sits there.
+  Seerr has no event for this, so it just sits there;
+- the drive filling up. SABnzbd pauses downloading once free space reaches its `download_free`, and
+  nothing tells anyone why: requests simply stop arriving.
 
-`monitoring/stack_watch.py` covers all four. It sends to the same ntfy topic as everything else.
+`monitoring/stack_watch.py` covers all five. It sends to the same ntfy topic as everything else.
 It is one standard-library Python script run by two systemd user timers, with no new container and no
 new account.
 
@@ -18,7 +20,7 @@ new account.
 
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
-| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart | High if new, else Default |
+| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new, else Default |
 | **… all clear** | Everything above has been fine for two checks | Low |
 | ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
 | ***host* is back online** | The first check after "unreachable" went out | Default |
@@ -27,8 +29,17 @@ new account.
 | **Stack watch on *host* started over** | Its state file was unreadable, so it was moved aside | Default |
 
 - **Problems** are a Compose service that is missing, exited, restarting or unhealthy; Jellyfin's
-  `/health` not saying `Healthy`; Docker not answering; or a Compose file that can't be read. While
-  Docker isn't answering, services keep the state they last had rather than being counted as recovered.
+  `/health` not saying `Healthy`; less than `DISK_FREE_MIN` free where the library or the downloads
+  live; Docker not answering; or a Compose file that can't be read. While Docker isn't answering,
+  services keep the state they last had rather than being counted as recovered.
+- **The disk problem** reads the filesystems behind `MEDIA_ROOT` and `SABNZBD_TEMP`. Paths that
+  share a filesystem share one entry (`disk: under 50G free for the library and downloads`); paths
+  on separate drives get one each. It reports the step it is under — `DISK_FREE_MIN`, then half,
+  a quarter and a tenth of it — rather than the figure itself. The figure changes on nearly every
+  run, and a changed description republishes the notification: a drive losing 2G per check from
+  200G costs 12 updates that way, which is the whole daily cap, so a container dying that day would
+  be muted. On the step ladder the same fill costs 4, and each one means it got materially worse.
+  Neither path is named: the topic is public and the paths name your home directory.
 - **The problem notification is updated in place**, and so are the heartbeat and "failing" ones (ntfy's
   `sequence_id`), so a problem that lasts a day is one notification that changes. A new problem goes out
   at once. Anything else (a problem clearing, or its description changing) waits until an hour after
@@ -90,6 +101,7 @@ checks.
    | -------- | ------- | ------- |
    | `NTFY_TOPIC` | required | Topic to publish to |
    | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `30m` to `71h`, or `off` |
+   | `DISK_FREE_MIN` | `100G` | Free space below which the drive is a problem: `1G`+ as `M`/`G`/`T`, or `off` |
    | `STALL_DAYS` | `3` | Days a wanted title may wait before the digest lists it |
    | `STALL_REMIND_DAYS` | `7` | Days between reminders about the same titles |
    | `JELLYFIN_URL` | `http://localhost:8096` | Jellyfin from this host, or `off` |
@@ -97,6 +109,13 @@ checks.
    | `NTFY_SERVER` | `https://ntfy.sh` | A self-hosted ntfy server; use https |
    | `SONARR_URL`, `RADARR_URL` | from `config.xml` | For an *arr that isn't on `localhost` at its configured port and URL base |
    | `STATE_DIR` | `~/.local/state/media-stack-watch` | Where the script keeps its state |
+
+   **`DISK_FREE_MIN` is an amount, not a percentage**, because what it has to protect is an amount.
+   SABnzbd stops downloading at its own `download_free` (50G in this stack) and says nothing anyone sees, so
+   the alert has to come far enough above that to leave room to act. At this stack's 1080p WEB
+   profile a film measures 3–9G and a season 10–27G, so the default `100G` is SABnzbd's floor plus
+   the largest season plus slack — and it still means that on a larger drive, where the same
+   percentage would be tens of titles of false headroom. `G` is 2^30 bytes, as in `df -h`.
 
    Blank values use the default; only `off` turns a check off. API keys are read from each service's
    `config.xml` under `CONFIG_ROOT` (a relative `CONFIG_ROOT` is taken from the repo root, as Compose
@@ -193,13 +212,23 @@ Run these from the repo root, one step at a time.
    python3 monitoring/stack_watch.py disarm --test
    ```
 
-5. **Stalled digest**, treating everything wanted as overdue:
+5. **The drive running out of room**, with a threshold no drive can satisfy, then two normal checks
+   for the all clear:
+
+   ```bash
+   DISK_FREE_MIN=1024T HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   DISK_FREE_MIN=1024T HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
+   ```
+
+6. **Stalled digest**, treating everything wanted as overdue:
 
    ```bash
    STALL_DAYS=0 python3 monitoring/stack_watch.py stalled --test
    ```
 
-6. **The watch failing**, with a setting it rejects, twice, then a clean run for "working again":
+7. **The watch failing**, with a setting it rejects, twice, then a clean run for "working again":
 
    ```bash
    HEARTBEAT_GRACE=never python3 monitoring/stack_watch.py check --test
@@ -218,8 +247,14 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   download that fails or can't be imported, but not one that never finishes.
 - **ntfy.sh itself.** Every alert here, and the offline alert especially, depends on ntfy.sh being up.
   Anyone who knows the topic can also cancel the scheduled heartbeat, since its sequence ID is predictable.
-- **A full disk, as such.** If the script can't save its state it sends nothing, rather than repeating
-  itself every run; the scheduled "unreachable" then goes out once the grace has passed. SABnzbd and the
-  *arrs report low disk space themselves.
+- **A disk that fills between two checks.** `DISK_FREE_MIN` is a warning with room to act in it, not a
+  guarantee: a large grab can cross it and SABnzbd's own floor inside one 15-minute interval. Once the
+  drive is genuinely full the script can't save its state either, so it sends nothing rather than
+  repeating itself every run, and the scheduled "unreachable" goes out once the grace has passed.
+- **A filesystem the stack writes to that is neither `MEDIA_ROOT` nor `SABNZBD_TEMP`**, such as a
+  `CONFIG_ROOT` on its own drive.
+- **A drive that failed to mount.** An unmounted mount point is an ordinary empty directory, so the
+  disk check reports the filesystem underneath it and sees plenty of room. Worth knowing when
+  `MEDIA_ROOT` moves onto its own drive; the *arrs will complain about the missing library first.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.

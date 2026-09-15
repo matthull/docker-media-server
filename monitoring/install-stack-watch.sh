@@ -1,8 +1,8 @@
 #!/bin/bash
 # Installs the stack watch (stack_watch.py) as two systemd *user* timers:
 #
-#   media-stack-watch     `check` every 15 minutes: containers, Jellyfin, Docker, and the
-#                         "host is unreachable" dead man's switch
+#   media-stack-watch     `check` every 15 minutes: containers, Jellyfin, Docker, free space, and
+#                         the "host is unreachable" dead man's switch
 #   media-stack-stalled   `stalled` daily: wanted titles that never download
 #
 # Run as the user who runs Docker, without sudo:
@@ -70,7 +70,7 @@ TimeoutStartSec=5min
 EOF
 }
 
-write_service "$CHECK" "Media stack watch: containers, Jellyfin and host heartbeat" check
+write_service "$CHECK" "Media stack watch: containers, Jellyfin, free space and host heartbeat" check
 write_service "$STALLED" "Media stack watch: wanted titles that never download" stalled
 
 cat > "$UNIT_DIR/$CHECK.timer" <<EOF

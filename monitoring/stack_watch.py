@@ -2,8 +2,9 @@
 """Stack watch: the alerts this stack's services cannot send about themselves.
 
   check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Jellyfin
-           stops answering, or Docker itself is down. Also keeps an ntfy dead man's switch
-           scheduled that fires if this host stops checking in (asleep, powered off, offline).
+           stops answering, the drive the library and downloads live on is running out of room,
+           or Docker itself is down. Also keeps an ntfy dead man's switch scheduled that fires if
+           this host stops checking in (asleep, powered off, offline).
   stalled  Daily. Alerts on monitored items Sonarr/Radarr still have no file for after
            STALL_DAYS. Nothing else reports this: a request can be accepted and then wait
            forever for a release that never comes.
@@ -56,6 +57,23 @@ MAX_EPISODES_LISTED = 4  # a series missing more episodes than this is shown as 
 MAX_MESSAGE_BYTES = 4096  # ntfy delivers anything longer as an attachment
 MAX_DETAIL_CHARS = 160  # longest library-written error detail quoted in a notification
 LOW, DEFAULT, HIGH = 2, 3, 4  # ntfy priorities
+SIZE_UNITS = {"M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+# The settings whose filesystems the disk check watches, and what an alert calls each one. Both are
+# checked separately because either can be moved to its own drive. The word, never the path, is what
+# goes out: the topic is public and the paths name the user's home directory.
+DISK_ROLES = (("MEDIA_ROOT", "library"), ("SABNZBD_TEMP", "downloads"))
+# Default DISK_FREE_MIN. SABnzbd pauses downloading at download_free (50G as shipped here) and says
+# nothing anyone sees, so requests stop arriving silently; the alert has to come well before that.
+# Measured on real releases at this stack's 1080p WEB profile: a film is 3-9G (the first real import
+# was 3.4G) and a season is 10-27G. 100G leaves SABnzbd's floor plus the largest season plus room to
+# act, and unlike a percentage it still means that on a bigger drive after the desktop migration.
+DISK_FREE_MIN_DEFAULT = "100G"
+# What a disk alert reports, as fractions of DISK_FREE_MIN. It reports the step it is under rather
+# than the figure itself, because the figure changes on nearly every run and a changed description
+# republishes the stack notification: measured over a drive losing 2G per check from 200G, that is
+# 12 updates, the whole STACK_DAILY_CAP, so a container dying the same day would be muted. On these
+# steps the same fill costs 4, and each one means it got materially worse.
+DISK_STEPS = (1, 0.5, 0.25, 0.1)
 
 Http = Callable[..., str]
 Run = Callable[[list], str]
@@ -112,6 +130,21 @@ def parse_duration(text: str) -> int:
     if not match:
         raise ValueError(f"invalid duration {text!r}: use a number and s/m/h/d, e.g. 90m or 24h")
     return int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+
+
+def parse_size(text: str) -> int:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([MGT])\s*", text, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"invalid size {text!r}: use a number and M/G/T, e.g. 100G")
+    return int(float(match[1]) * SIZE_UNITS[match[2].upper()])
+
+
+def size(nbytes: float) -> str:
+    """The largest whole unit, in parse_size's format."""
+    for unit, scale in (("T", SIZE_UNITS["T"]), ("G", SIZE_UNITS["G"]), ("M", SIZE_UNITS["M"])):
+        if nbytes >= scale:
+            return f"{nbytes / scale:.10g}{unit}"
+    return f"{int(nbytes)}B"
 
 
 def span(delta: timedelta) -> str:
@@ -493,6 +526,54 @@ def jellyfin_problem(url: str, http: Http) -> str | None:
     return "jellyfin: unexpected answer from /health"  # not Jellyfin's words, so not forwarded
 
 
+def disk_minimum(cfg: dict) -> int | None:
+    """DISK_FREE_MIN in bytes, or None when the disk check is off. Blank means the default, as
+    everywhere else; only "off" turns the check off."""
+    text = (cfg.get("DISK_FREE_MIN") or "").strip() or DISK_FREE_MIN_DEFAULT
+    if text.lower() == "off":
+        return None
+    try:
+        minimum = parse_size(text)
+    except ValueError as exc:
+        raise WatchError("DISK_FREE_MIN must be a size like 100G, or off") from exc
+    if minimum < SIZE_UNITS["G"]:
+        raise WatchError("DISK_FREE_MIN must be at least 1G, or off")
+    return minimum
+
+
+def filesystem_free(path: str) -> tuple[int, int]:
+    """(which filesystem, bytes on it this user may still write) for the filesystem holding path."""
+    stat = os.statvfs(path)
+    return os.stat(path).st_dev, stat.f_bavail * stat.f_frsize
+
+
+def disk_problems(cfg: dict, minimum: int, free_space=filesystem_free) -> dict[str, str]:
+    """One entry per filesystem behind DISK_ROLES with less than `minimum` free. Paths sharing a
+    filesystem share an entry: on a single-drive host that is one alert, not one per role. A path
+    that isn't configured isn't checked; one that can't be read is a problem in its own right, and
+    is reported rather than raised, so the container and Jellyfin checks still run."""
+    filesystems: dict[int, tuple[list[str], int]] = {}
+    problems = {}
+    for key, role in DISK_ROLES:
+        path = (cfg.get(key) or "").strip()
+        if not path:
+            continue
+        try:
+            device, free = free_space(path)
+        except OSError as exc:
+            print(f"can't read free space for {key}: {exc}", file=sys.stderr)
+            problems[f"disk:{role}"] = f"disk: can't read free space for the {role} path"
+            continue
+        filesystems.setdefault(device, ([], free))[0].append(role)
+    for roles, free in filesystems.values():
+        if free >= minimum:
+            continue
+        step = min(fraction for fraction in DISK_STEPS if free < minimum * fraction)
+        problems[f"disk:{'+'.join(roles)}"] = (
+            f"disk: under {size(minimum * step)} free for the {' and '.join(roles)}")
+    return problems
+
+
 def gather_problems(watch: Watch) -> dict[str, str]:
     problems = stack_problems(Path(watch.cfg["STACK_DIR"]), watch.run)
     jellyfin_url = watch.cfg.get("JELLYFIN_URL") or "http://localhost:8096"
@@ -500,6 +581,9 @@ def gather_problems(watch: Watch) -> dict[str, str]:
         problem = jellyfin_problem(jellyfin_url, watch.http)
         if problem:
             problems["jellyfin"] = problem
+    minimum = disk_minimum(watch.cfg)
+    if minimum is not None:
+        problems |= disk_problems(watch.cfg, minimum)
     return problems
 
 

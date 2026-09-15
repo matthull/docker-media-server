@@ -145,6 +145,30 @@ class DurationTest(unittest.TestCase):
                          ["10s", "30m", "71h", "3d", "90s"])
 
 
+class SizeTest(unittest.TestCase):
+    def test_units_and_decimals(self):
+        self.assertEqual(sw.parse_size("100G"), 100 * 1024 ** 3)
+        self.assertEqual(sw.parse_size(" 2 T "), 2 * 1024 ** 4)
+        self.assertEqual(sw.parse_size("512M"), 512 * 1024 ** 2)
+        self.assertEqual(sw.parse_size("1.5G"), int(1.5 * 1024 ** 3))
+        self.assertEqual(sw.parse_size("100g"), 100 * 1024 ** 3)
+
+    def test_rejects_garbage(self):
+        for text in ("", "100", "100K", "100GB", "lots", "-5G", "1e3G"):
+            with self.assertRaises(ValueError):
+                sw.parse_size(text)
+
+    def test_size_renders_in_parse_sizes_format(self):
+        self.assertEqual(sw.size(100 * 1024 ** 3), "100G")
+        self.assertEqual(sw.size(25 * 1024 ** 3), "25G")
+        self.assertEqual(sw.size(2 * 1024 ** 4), "2T")
+        self.assertEqual(sw.size(512 * 1024 ** 2), "512M")
+        self.assertEqual(sw.size(int(1.5 * 1024 ** 3)), "1.5G")
+        for count in (1, 25, 100, 512):
+            for unit in "MGT":
+                self.assertEqual(sw.size(sw.parse_size(f"{count}{unit}")), f"{count}{unit}")
+
+
 class ScheduleTest(unittest.TestCase):
     def test_check_timer_runs_every_check_interval(self):
         installer = Path(sw.__file__).with_name("install-stack-watch.sh").read_text()
@@ -415,6 +439,96 @@ class JellyfinTest(unittest.TestCase):
         http_error = urllib.error.HTTPError("http://jf/health", 503, "x", {}, None)
         self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": http_error})),
                          "jellyfin: health check returned HTTP 503")
+
+
+def free_space(*known):
+    """A fake filesystem_free: (path, (device, bytes free)) pairs. Any other path is unreadable."""
+    paths = dict(known)
+
+    def reader(path):
+        if path not in paths:
+            raise OSError(2, "No such file or directory")
+        return paths[path]
+    return reader
+
+
+GB = 1024 ** 3
+DISK_CFG = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl"}
+
+
+class DiskTest(unittest.TestCase):
+    def problems(self, minimum, library, downloads):
+        reader = free_space(("/lib", library), ("/dl", downloads))
+        return sw.disk_problems(DISK_CFG, minimum, reader)
+
+    def test_quiet_while_there_is_room(self):
+        self.assertEqual(self.problems(100 * GB, (1, 143 * GB), (1, 143 * GB)), {})
+        self.assertEqual(self.problems(100 * GB, (1, 100 * GB), (1, 100 * GB)), {})
+
+    def test_paths_that_share_a_filesystem_are_one_problem(self):
+        self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (1, 30 * GB)),
+                         {"disk:library+downloads": "disk: under 50G free for the library and downloads"})
+
+    def test_separate_filesystems_are_reported_separately(self):
+        self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (2, 500 * GB)),
+                         {"disk:library": "disk: under 50G free for the library"})
+        self.assertEqual(self.problems(100 * GB, (1, 500 * GB), (2, 5 * GB)),
+                         {"disk:downloads": "disk: under 10G free for the downloads"})
+
+    def test_it_reports_the_lowest_step_it_is_under(self):
+        """The exact figure would differ on nearly every run, and republish the stack notification
+        every hour as downloads nudged it. A step only changes when crossing one, which is news."""
+        under = {free: self.problems(100 * GB, (1, free), (1, free))["disk:library+downloads"]
+                 .removeprefix("disk: under ").removesuffix(" free for the library and downloads")
+                 for free in (99 * GB, 50 * GB, 50 * GB - 1, 25 * GB, 25 * GB - 1,
+                              10 * GB, 10 * GB - 1, 0)}
+        self.assertEqual(list(under.values()),
+                         ["100G", "100G", "50G", "50G", "25G", "25G", "10G", "10G"])
+
+    def test_the_lowest_step_is_a_floor_not_a_promise_of_more(self):
+        """Under the smallest step there is nothing smaller to report, so the text stops changing."""
+        self.assertEqual(self.problems(100 * GB, (1, 1), (1, 1))["disk:library+downloads"],
+                         "disk: under 10G free for the library and downloads")
+
+    def test_a_path_that_is_not_set_is_not_checked(self):
+        reader = free_space(("/dl", (1, 5 * GB)))
+        self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": "/dl"}, 100 * GB, reader),
+                         {"disk:downloads": "disk: under 10G free for the downloads"})
+        self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "  "}, 100 * GB, reader), {})
+
+    def test_an_unreadable_path_is_reported_not_raised(self):
+        reader = free_space(("/dl", (1, 500 * GB)))
+        with contextlib.redirect_stderr(io.StringIO()):
+            problems = sw.disk_problems(DISK_CFG, 100 * GB, reader)
+        self.assertEqual(problems, {"disk:library": "disk: can't read free space for the library path"})
+
+    def test_an_unreadable_path_never_carries_the_os_error_text(self):
+        def reader(path):
+            raise OSError(13, "SENTINEL_SECRET")
+        with contextlib.redirect_stderr(io.StringIO()):
+            problems = sw.disk_problems(DISK_CFG, 100 * GB, reader)
+        self.assertNotIn("SENTINEL", json.dumps(problems))
+
+    def test_bad_setting_is_rejected_in_words_the_script_wrote(self):
+        for text in ("lots", "0G", "100", "500M"):
+            with self.assertRaises(sw.WatchError) as caught:
+                sw.disk_minimum({"DISK_FREE_MIN": text})
+            self.assertIn("DISK_FREE_MIN", str(caught.exception))
+        self.assertEqual(sw.disk_minimum({"DISK_FREE_MIN": "100G"}), 100 * GB)
+        self.assertEqual(sw.disk_minimum({"DISK_FREE_MIN": "1G"}), GB)
+
+    def test_a_blank_setting_means_the_default_and_only_off_turns_it_off(self):
+        """.env.example ships the key blank, so blank must not be read as "no disk check"."""
+        self.assertEqual(sw.disk_minimum({}), sw.parse_size(sw.DISK_FREE_MIN_DEFAULT))
+        self.assertEqual(sw.disk_minimum({"DISK_FREE_MIN": ""}), sw.parse_size("100G"))
+        self.assertEqual(sw.disk_minimum({"DISK_FREE_MIN": "   "}), sw.parse_size("100G"))
+        for off in ("off", "OFF", "Off", " off "):
+            self.assertIsNone(sw.disk_minimum({"DISK_FREE_MIN": off}), off)
+
+    def test_the_default_leaves_room_to_act_above_sabnzbds_own_floor(self):
+        """SABnzbd pauses at download_free (50G as shipped) without telling anyone why. The default
+        has to clear that by more than the largest season measured on this stack's profile (27G)."""
+        self.assertGreaterEqual(sw.parse_size(sw.DISK_FREE_MIN_DEFAULT), sw.parse_size("50G") + 27 * GB)
 
 
 class AdvanceTest(unittest.TestCase):
@@ -723,6 +837,26 @@ class RunCheckTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             problems = sw.stack_problems(Path("/stack"), raises(RuntimeError("line 3: 'SENTINEL_SECRET")))
         self.assertEqual(problems, {"compose": "compose: can't read the stack config (details in the journal)"})
+
+    def test_disk_is_watched_alongside_the_containers(self):
+        """A threshold above any real drive, so the check reports the filesystem it is run on."""
+        state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "1024T"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
+        [sent] = self.check(state, healthy, 15 * MIN, cfg)
+        self.assertEqual(sent["title"], "Media stack on h: 1 problem")
+        self.assertRegex(sent["message"], r"^• disk: under [\d.]+[MGT] free for the library$")
+        self.assertNotIn("/", sent["message"])  # the path names the user's home; the topic is public
+
+    def test_disk_check_is_off_by_the_setting(self):
+        state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "off"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        for minutes in (0, 15):
+            self.assertEqual(self.check(state, healthy, minutes * MIN, cfg), [])
+
+    def test_a_rejected_disk_setting_becomes_a_failing_alert_not_a_silent_skip(self):
+        with self.assertRaises(sw.WatchError):
+            self.check({}, docker(), 0 * MIN, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "lots"})
 
     def test_blank_jellyfin_url_means_default(self):
         http = FakeHttp({"/health": "Healthy"})
