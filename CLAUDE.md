@@ -46,8 +46,12 @@ backup/
   backup-config.sh                  # Opt-in off-site: restic → S3-compatible, snapshots SQLite DBs
   install-restic-timer.sh           # Daily systemd timer for the above
   .env.example                      # Restic credentials (off-site only)
+monitoring/
+  stack_watch.py                    # ntfy alerts for dead containers, host offline, stalled requests
+  test_stack_watch.py               # python3 -m unittest discover -s monitoring
+  install-stack-watch.sh            # systemd --user timers for the above; see docs/stack-watch.md
 docs/                               # Per-service setup guides
-.env.example                        # TZ, PUID/PGID, MEDIA_ROOT, CONFIG_ROOT, SABNZBD_TEMP, TS_AUTHKEY
+.env.example                        # TZ, PUID/PGID, MEDIA_ROOT, CONFIG_ROOT, SABNZBD_TEMP, TS_AUTHKEY, stack watch
 ```
 
 There is no `extras/`. Every service in the repo is one this stack actually runs, so anything

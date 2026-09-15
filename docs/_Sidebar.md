@@ -13,5 +13,6 @@
 - [Cloudflare Tunnel](Cloudflared)
 - [Jellyfin Plugins](Jellyfin-Plugins)
 - [Notifications](Notifications)
+- [Stack Watch](Stack-Watch)
 - [Backups](Backups)
 - [Usenet Indexers](Usenet-Indexers)

@@ -15,3 +15,6 @@ proxmox_mcp.log
 local/
 CLAUDE.local.md
 docker-compose.override.yml
+
+# Python bytecode (monitoring/)
+__pycache__/

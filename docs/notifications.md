@@ -105,6 +105,12 @@ a = apprise.Apprise(); a.add('ntfys://ntfy.sh/<topic>?priority=high')
 print(a.notify(title='Test', body='Hello'))\""
 ```
 
+## What these can't report
+
+Every connector above is a service reporting on itself. None of them can say that its own container
+stopped, that the host went to sleep, or that a request was accepted and then never found a release.
+[Stack watch](Stack-Watch) covers those, on the same ntfy topic.
+
 ## If you outgrow ntfy.sh
 
 Self-hosting ntfy is a small Go binary and removes the public-topic problem. One caveat before you
