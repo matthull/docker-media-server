@@ -61,6 +61,11 @@ the guard has not been watched doing its job. Treat it as well-founded but unpro
 with no "Play on Jellyfin" link until a Jellyfin scan runs (nightly by default). Availability is
 correct throughout; only the deep link is missing.
 
+**This is a Seerr setting, not Compose config — it does not travel with this repo.** It lives in
+Seerr's own config volume, so moving the stack to another machine, or restoring from a backup that
+skips that volume, silently reverts TV to "Processing" while every container still reports healthy.
+Re-apply it after any migration and check `GET /api/v1/settings/jobs`.
+
 **Do not raise this past ~1,000 series without re-timing it.** Each run walks *every* series with no
 change detection. Its pacing *floor* is `ceil(series / 50) × 4s` — one fixed 4s sleep per bundle of
 50 — but real runs land well above the floor, because per-series work adds to it. The two figures
