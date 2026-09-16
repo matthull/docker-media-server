@@ -268,9 +268,12 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
 - **ntfy.sh itself.** Every alert here, and the offline alert especially, depends on ntfy.sh being up.
   Anyone who knows the topic can also cancel the scheduled heartbeat, since its sequence ID is predictable.
 - **A disk that fills between two checks.** `DISK_FREE_MIN` is a warning with room to act in it, not a
-  guarantee: a large grab can cross it and SABnzbd's own floor inside one 15-minute interval. Once the
-  drive is genuinely full the script can't save its state either, so it sends nothing rather than
-  repeating itself every run, and the scheduled "unreachable" goes out once the grace has passed.
+  guarantee: a large enough grab can cross more than one step between checks. For scale, the fastest
+  fill measured on this host was ~21 GiB/h while a season was downloading, or ~5 GiB per 15-minute
+  check — enough to skip a step, not enough to clear `DISK_FREE_MIN` and SABnzbd's floor together.
+  Worth re-checking on a much faster connection. Once the drive is genuinely full the script can't
+  save its state either, so it sends nothing rather than repeating itself every run, and the
+  scheduled "unreachable" goes out once the grace has passed.
 - **A filesystem the stack writes to that is neither `MEDIA_ROOT` nor `SABNZBD_TEMP`**, such as a
   `CONFIG_ROOT` on its own drive.
 - **A drive that failed to mount.** An unmounted mount point is an ordinary empty directory, so the
