@@ -231,9 +231,16 @@ itself a trap (image bumps wipe it silently) are in [docs/seerr.md](./docs/seerr
 
 **Bazarr provider reality (1.6.0):** `podnapisi` was removed upstream and is silently dropped from
 `enabled_providers` on restart; `subsource` needs an API key and throttles with `ConfigurationError`
-without one; `subf2m` needs a `user_agent` or fails identically, forever. Enabled and healthy here:
-`opensubtitlescom`, `gestdown` (TV only), `subf2m`, `yifysubtitles`. Subscene, which most guides still
-recommend, shut down in 2024.
+without one; `subf2m` needs a `user_agent` or fails identically, forever — the provider itself raises
+`ConfigurationError("User-agent config missing")`, the site does not care. The usable set is
+`opensubtitlescom`, `gestdown` (TV only), `subf2m` (with `settings-subf2m-user_agent` set) and
+`yifysubtitles`. Which of them a host actually has enabled is a host fact, so check it rather than
+trusting a doc: `GET /api/providers` lists the enabled ones. `GET /api/system/settings` also returns
+provider credentials, so filter it (`.general.enabled_providers`) rather than printing it whole.
+`Good` in `/api/providers` only means "not throttled", even for a provider that has never been
+queried. `GET /api/providers/movies?radarrid=<id>` searches without downloading and proves one really
+returns results. Saving a new user agent does not lift an existing throttle; reset it
+(`POST /api/providers`, `action=reset`). Details in [docs/bazarr.md](./docs/bazarr.md). Subscene, which most guides still recommend, shut down in 2024.
 
 **Intro Skipper's manifest URLs 308-redirect to a bare GitHub org** and cannot be added.
 **Do NOT install TheIntroDB as a substitute** — its `Dispose()` throws `ObjectDisposedException: The
