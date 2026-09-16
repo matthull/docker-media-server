@@ -70,14 +70,66 @@ The arrangement here cannot do that:
 - **The patch is in git** and travels with the repo, so a migration or a fresh clone carries it.
 - **`patch-downloadtracker.sh` re-runs on every build** and asserts what it found *before* and *after*
   editing. If the two call sites are not there in the expected shape, it exits non-zero, the build
-  fails, **no image is produced**, and the previously built patched image keeps serving. The failure
-  surfaces on the build host, in front of whoever is doing the bump.
+  fails, **no image is produced**, and — *if Seerr is already running* — the previously built patched
+  image keeps serving. The failure surfaces on the build host, in front of whoever is doing the bump.
+  If the stack is *not* already running, the same failure is an outage of every service; see below.
 - **`pull_policy: build`** in `docker-compose.yml` makes `docker compose up -d` rebuild from the
   pinned base rather than reuse the last local build, so a Renovate bump of the `FROM` actually
   reaches the running container instead of sitting unused. Layer caching makes the no-op case ~1s.
 - **No `image:` key** on the service, so nothing can pull over the built image.
 
 Both guard directions are tested, not assumed — see the negative controls below.
+
+### A failed build on a cold start takes the whole stack down
+
+"The old image keeps serving" is only true on a **warm** host. `docker compose up -d` builds `seerr`
+before it creates or starts any container, and a failed build aborts the entire command. So:
+
+- **Containers already running** stay running (the documented warm case).
+- **Containers that exist but are stopped** (`docker compose stop`) stay stopped — *all* of them.
+- **No containers** (`docker compose down`, a fresh clone, a migration to a new host) — **nothing
+  is created at all**: Sonarr, Radarr, SABnzbd, Prowlarr, Bazarr and every other service in this
+  file stay down, not just Seerr. (Jellyfin runs outside this stack and is unaffected, but nothing
+  new reaches it.)
+
+Reproduced 2026-09-16 with a throwaway two-service project (a failing `build:` service with
+`pull_policy: build` next to an unrelated pull-only service), in each state above. A reboot should
+be the warm case — Docker restarts `restart: unless-stopped` containers itself, without Compose or a
+build — but that part is inferred from the restart policy, not tested.
+
+**Getting the rest of the stack up while the patch is broken:**
+
+```sh
+# containers exist but are stopped: start them without building
+docker compose start
+
+# no containers: start every service except seerr
+docker compose up -d $(docker compose config --services | grep -vx seerr)
+```
+
+Both verified against the same throwaway project. `docker compose up -d --no-build` does **not**
+help on a cold host: with no seerr image it fails (`No such image`, exit 1) and leaves the other
+containers created but not started. Nothing in this stack `depends_on` seerr, so excluding it is safe.
+Then fix the patch as in [When a bump breaks the build](#when-a-bump-breaks-the-build).
+
+**What catches it before it gets that far:** `.github/workflows/build-seerr.yml` builds this image,
+through the same Compose definition, on every pull request and every push to `main` that touches
+`images/seerr/`, `docker-compose.yml` or the workflow, and then checks the built image itself for
+zero `refreshMonitoredDownloads` references. Its limits:
+
+- On a pull request a red check stops the merge only if someone (or Renovate) respects it. There is
+  no branch protection on this fork, so a human can still merge red. Renovate, per its docs, does not
+  automerge until checks pass — not tested here.
+- A direct push to `main` is built **after** it lands; the run reports the breakage, it does not
+  prevent it. **A red "Build seerr image" run on `main` means: do not `down` or migrate this stack
+  until it is green.**
+- Renovate's config is inherited from upstream, but as of 2026-09-16 Renovate has opened no pull
+  request on this fork, so `FROM` bumps currently arrive by hand.
+
+Negative controls for the workflow, run on GitHub (throwaway PR #2, closed): a patch regex that no
+longer matches failed at the build step; a patch script neutered to `exit 0` built an image with 2
+call sites left and failed at the image check. Locally, a nonexistent base digest failed at
+metadata resolution.
 
 ### The one way to get a stale base anyway
 

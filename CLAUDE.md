@@ -375,6 +375,18 @@ back to `image:` — see `images/seerr/README.md` for the measurements and for w
 silently revert it. If a bump makes `docker compose up -d` fail in the patch script, that is the
 design working: read the new `downloadtracker.js` and update the `sed`, don't bypass it.
 
+**A failed `seerr` build is only harmless on a warm host.** `up -d` builds before it starts anything,
+so a failed build leaves running containers running, but stopped ones stay stopped, and after
+`docker compose down`, a fresh clone or a migration **no service in the stack starts at all**.
+`.github/workflows/build-seerr.yml` builds the image (and checks it has zero call sites) on every PR
+and every push to `main` touching `images/seerr/`, `docker-compose.yml` or the workflow. A push
+straight to `main` is only checked after it lands, so **check that the latest "Build seerr image"
+run on `main` is green before any `down`, restart-from-cold or migration**. Recovery commands are in
+`images/seerr/README.md`. Renovate's config is inherited from upstream but has opened nothing on
+this fork, so `FROM` bumps arrive by hand for now. Upstream's `tag.yml` and `wiki.yml` workflows are
+disabled on this fork (`gh workflow list`): the first can only fail here, and the second publishes
+`docs/` to the fork's wiki.
+
 **Update this stack with a plain `docker compose up -d`.** `--pull always` and `--no-build` both skip
 the build silently (exit 0, no warning) and keep the old image, which leaves `seerr` on a stale base
 with everything reporting healthy, and nothing detects that. An *unpatched* Seerr is detected:

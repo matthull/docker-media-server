@@ -190,7 +190,12 @@ every container still reporting healthy. Three things make that impossible here,
 
 - the patch is in git, so it travels with the repo;
 - the patch script asserts the call sites before and after editing and **fails the build** if it
-  cannot patch, so no unpatched image is ever produced — the last good one keeps serving;
+  cannot patch, so no unpatched image is ever produced — the last good one keeps serving **if Seerr
+  is already running**. On a cold start (after `docker compose down`, on a fresh clone or a new host)
+  the failed build aborts the whole `up -d` and **no service in the stack starts**. The
+  `Build seerr image` workflow builds the image on every pull request and push to `main` that touches
+  it, so that failure shows up as a red check instead; a red run on `main` means do not `down` or
+  migrate the stack until it is fixed. The README has the recovery commands;
 - `pull_policy: build` makes a plain `docker compose up -d` rebuild from the pinned base, so a bump
   actually reaches the container instead of sitting unused. **Not absolute:** `up -d --pull always`
   and `up -d --no-build` both skip the build silently and keep the old image running (verified, exit
