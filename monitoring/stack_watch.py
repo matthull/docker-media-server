@@ -57,8 +57,12 @@ FAILURE_REPEAT = timedelta(days=1)  # "Stack watch is failing" is re-sent this o
 # changes again — which the disk's ratchet makes the normal case rather than the exception. A drive
 # parked at 5G free would then be a single notification, possibly swiped away weeks ago, with no all
 # clear coming until somebody acts. A day matches FAILURE_REPEAT, and costs one message a day out of
-# ntfy.sh's shared 250 against the heartbeat's 24 and the stack notification's 12: the re-nudge is
-# still subject to STACK_DAILY_CAP, so it can only ever be the cheapest of those three.
+# ntfy.sh's shared 250 against the heartbeat's 24 and the stack notification's 12. That ceiling is
+# structural, NOT a matter of STACK_DAILY_CAP, which can never mute a re-send: publish_stack prunes
+# its record of sends to this same window, so the record is empty exactly when a re-send is due and
+# the cap has nothing to count. Publishing refills it, which is what holds the rate to one a day.
+# This constant is therefore real and retunable only because that prune follows it — an earlier
+# version pruned at a flat day, which made every value above a day behave identically.
 STACK_REPEAT = timedelta(days=1)
 MAX_DELAY = timedelta(days=3)  # ntfy.sh's message-delay-limit
 STALL_REMINDERS = 2  # reminders about a stalled title after the digest that first listed it
@@ -584,6 +588,11 @@ def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT,
     be cancelled — which is safe because it is a daemon thread and so doesn't hold up the
     interpreter's exit. Giving up raises TimeoutError, an OSError, so it arrives at disk_problems'
     unreadable-path branch as any other unreadable path does.
+
+    Neither obvious alternative works. `subprocess.run(timeout=)` is not safer: on timeout it calls
+    kill() and then communicate() with no timeout of its own, and a process wedged in D-state does
+    not die on SIGKILL, so it can block in exactly the same way. `ThreadPoolExecutor` is worse — its
+    workers are non-daemon and its atexit hook joins them, which is the hang this avoids.
 
     Without this the whole run is lost rather than one path: the disk check runs after the container
     and Jellyfin checks, so TimeoutStartSec would SIGTERM the unit with their results gathered but

@@ -17,6 +17,10 @@ Usenet downloader. Takes NZBs from Sonarr/Radarr, downloads, repairs, unpacks.
 - **SSD temp path** — `SABNZBD_TEMP` is mounted at `/incomplete` with the override file, or
   `/downloads/intermediate` without it. Point it at an SSD; in-progress downloads deliberately stay
   off the media mount so unpacking is fast and the import that follows is a free hardlink.
+  **If you move it onto its own drive while the disk alert is active, expect one High "2 problems"
+  update** as the stack watch stops wording the two roles as one drive and starts reporting them
+  separately. Nothing has got worse — the watched layout changed, and any changed wording is read as
+  a worsening. Both drives keep the low point they had already reported.
 - **API auth is the query parameter only** — `?apikey=`. Unlike the *arrs, SABnzbd rejects the header
   form.
 - **Host whitelist** — if the *arrs can't connect, add the container name under
