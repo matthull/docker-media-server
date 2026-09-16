@@ -574,14 +574,16 @@ class DiskTest(unittest.TestCase):
         self.assertEqual([level(free) for free in
                           (60 * GB, 49 * GB, 60 * GB, 99 * GB, 20 * GB, 60 * GB, 5 * GB, 99 * GB)],
                          ["100G", "50G", "50G", "50G", "25G", "25G", "10G", "10G"])
-        self.assertEqual(floors, {"disk:library": 10 * GB, "disk:downloads": 10 * GB})
+        self.assertEqual(floors, {"disk:library": {"device": 1, "level": 10 * GB},
+                                  "disk:downloads": {"device": 1, "level": 10 * GB}})
 
     def test_retuning_the_threshold_never_claims_a_level_the_drive_was_not_under(self):
         """The floor is a level in bytes, not a fraction, so lowering DISK_FREE_MIN mid-problem
         cannot rescale it into a claim that was never true."""
         floors = {}
         self.problems(100 * GB, (1, 49 * GB), (1, 49 * GB), floors)
-        self.assertEqual(floors, {"disk:library": 50 * GB, "disk:downloads": 50 * GB})
+        self.assertEqual(floors, {"disk:library": {"device": 1, "level": 50 * GB},
+                                  "disk:downloads": {"device": 1, "level": 50 * GB}})
         text = self.problems(60 * GB, (1, 45 * GB), (1, 45 * GB), floors)["disk:library"]
         self.assertEqual(text, "disk: dropped below 50G free for the library and downloads")
 
@@ -621,20 +623,26 @@ class DiskTest(unittest.TestCase):
         floors = {}
         self.assertEqual(self.problems(100 * GB, (1, 20 * GB), (1, 20 * GB), floors).keys(),
                          {"disk:library", "disk:downloads"})
-        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+        self.assertEqual(floors, {"disk:library": {"device": 1, "level": 25 * GB},
+                                  "disk:downloads": {"device": 1, "level": 25 * GB}})
         split = self.problems(100 * GB, (1, 20 * GB), (2, 5 * GB), floors)
         self.assertEqual(split, {"disk:library": "disk: dropped below 25G free for the library",
                                  "disk:downloads": "disk: dropped below 10G free for the downloads"})
-        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 10 * GB})
+        self.assertEqual(floors, {"disk:library": {"device": 1, "level": 25 * GB},
+                                  "disk:downloads": {"device": 2, "level": 10 * GB}})
 
     def test_filesystems_merging_mid_problem_still_read_as_one_sentence(self):
-        """The mirror of the split: two floors converge onto one filesystem. They have to agree, or
-        the same drive goes out as two bullets claiming two different low points."""
-        floors = {"disk:library": 50 * GB, "disk:downloads": 25 * GB}
-        merged = self.problems(100 * GB, (1, 20 * GB), (1, 20 * GB), floors)
+        """The mirror of the split: downloads joins the drive the library is already on. Its old
+        drive's low point is not the new drive's, so it is dropped, and the floor already held for
+        this device governs both roles — one sentence, not two bullets for one drive claiming two
+        different low points."""
+        floors = {"disk:library": {"device": 1, "level": 50 * GB},
+                  "disk:downloads": {"device": 2, "level": 25 * GB}}
+        merged = self.problems(100 * GB, (1, 40 * GB), (1, 40 * GB), floors)
         self.assertEqual(set(merged.values()),
-                         {"disk: dropped below 25G free for the library and downloads"})
-        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+                         {"disk: dropped below 50G free for the library and downloads"})
+        self.assertEqual(floors, {"disk:library": {"device": 1, "level": 50 * GB},
+                                  "disk:downloads": {"device": 1, "level": 50 * GB}})
 
     def test_a_wedged_filesystem_is_given_up_on_rather_than_blocking_the_run(self):
         """os.statvfs and os.stat were the only external calls here with no timeout of their own, and
@@ -651,6 +659,43 @@ class DiskTest(unittest.TestCase):
             sw.filesystem_free("/lib", timeout=0.2, read=wedged)
         self.assertLess(time.monotonic() - began, 5)
         self.assertTrue(started.is_set())
+
+    def test_the_abandoned_read_runs_on_a_daemon_thread(self):
+        """daemon=True is the whole safety of abandoning the read rather than cancelling it — a
+        thread stuck in a syscall cannot be cancelled, and a non-daemon one is joined at interpreter
+        shutdown, which is precisely the TimeoutStartSec SIGTERM this was written to prevent.
+        Measured separately: the same script exits in ~0.4s with daemon=True and hangs without it."""
+        release = threading.Event()
+        before = set(threading.enumerate())
+        with self.assertRaises(TimeoutError):
+            sw.filesystem_free("/lib", timeout=0.2, read=lambda path: release.wait(30))
+        [abandoned] = [t for t in threading.enumerate() if t not in before]
+        try:
+            self.assertTrue(abandoned.daemon)
+        finally:
+            release.set()
+            abandoned.join(5)
+
+    def test_a_floor_does_not_follow_a_role_onto_a_different_drive(self):
+        """The floor belongs to the filesystem, not to the role. Keyed by role alone it would move
+        with MEDIA_ROOT onto a bigger drive and go on reporting a level that drive has never been
+        under — and because the description wouldn't change, publish_stack would never republish it,
+        so the falsehood would stand silently for as long as the problem lasted."""
+        floors = {}
+        self.problems(100 * GB, (1, 5 * GB), (1, 5 * GB), floors)
+        self.assertEqual(floors["disk:library"], {"device": 1, "level": 10 * GB})
+        moved = self.problems(100 * GB, (9, 60 * GB), (1, 5 * GB), floors)
+        self.assertEqual(moved["disk:library"], "disk: dropped below 100G free for the library")
+        self.assertEqual(floors["disk:library"], {"device": 9, "level": 100 * GB})
+        self.assertEqual(floors["disk:downloads"], {"device": 1, "level": 10 * GB})
+
+    def test_a_floor_inherited_without_a_device_is_honoured_once_then_stamped(self):
+        """Upgrading mustn't throw away a low point already reported; migrate_disk_keys leaves the
+        level with no device, and the first run that reads it learns which drive it was on."""
+        floors = {"disk:library": {"level": 10 * GB}, "disk:downloads": {"level": 10 * GB}}
+        text = self.problems(100 * GB, (4, 60 * GB), (4, 60 * GB), floors)["disk:library"]
+        self.assertEqual(text, "disk: dropped below 10G free for the library and downloads")
+        self.assertEqual(floors["disk:library"], {"device": 4, "level": 10 * GB})
 
     def test_a_readable_filesystem_is_not_slowed_down_by_the_timeout(self):
         self.assertEqual(sw.filesystem_free("/lib", read=lambda path: (7, 3 * GB)), (7, 3 * GB))
@@ -1039,6 +1084,29 @@ class RunCheckTest(unittest.TestCase):
         exited = docker(container("sonarr", "exited", exit_code=1), container("radarr"))
         self.assertEqual(self.check(state, exited, 15 * MIN), [])
 
+    def test_upgrading_from_a_role_set_disk_key_says_nothing_at_all(self):
+        """The key used to be disk:library+downloads. On the first run after the upgrade that key
+        retires and two unseen ones arrive, which publish_stack can only read as new problems: a
+        rotating_light, at top priority, about a drive where nothing has happened. And since the
+        floor went with the retired key, a drive that had recovered from 5G to 40G within the episode
+        would be recomputed at a higher step, so the emergency would carry *better* news than the
+        message it replaced. Nothing changed, so nothing should be sent."""
+        old = "disk: dropped below 10G free for the library and downloads"
+        state = {"disk": {"disk:library+downloads": 10 * GB},
+                 "tracked": {"disk:library+downloads": {"count": 40, "alerted": True, "absent": 0,
+                                                        "description": old,
+                                                        "first": (NOW - 4 * DAY).isoformat(),
+                                                        "seen": NOW.isoformat()}},
+                 "stack": {"shown": {"disk:library+downloads": old},
+                           "sent": [(NOW - 2 * HOUR).isoformat()]}}
+        cfg = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy = docker(container("sonarr"), container("radarr"))
+        with mounted(Drive(40 * GB)):  # recovered within the episode; the ratchet must hold at 10G
+            self.assertEqual(self.check(state, healthy, 15 * MIN, cfg), [])
+        self.assertEqual(state["stack"]["shown"], {"disk:library": old, "disk:downloads": old})
+        self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 10 * GB},
+                                         "disk:downloads": {"device": 1, "level": 10 * GB}})
+
     def test_a_stack_record_written_before_sent_existed_does_not_repeat_an_alert(self):
         """The previous upgrade path wrote {"shown": ...} with no "sent", so on disk right now there
         are records that look exactly like "nothing has gone out in over a day" — which is the very
@@ -1137,7 +1205,7 @@ class RunCheckTest(unittest.TestCase):
         with mounted(drive):
             for minutes in (0, 15):
                 self.check(state, healthy, minutes * MIN, cfg)
-            self.assertEqual(state["disk"], {"disk:library": 25 * GB})
+            self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 25 * GB}})
             drive.free = 500 * GB
             for minutes in (30, 45, 60):
                 self.check(state, healthy, minutes * MIN, cfg)
@@ -1181,7 +1249,8 @@ class RunCheckTest(unittest.TestCase):
         with mounted(lambda path: layout[path]):
             for minutes in (0, 15):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
-            self.assertEqual(state["disk"], {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+            self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 25 * GB},
+                                             "disk:downloads": {"device": 1, "level": 25 * GB}})
             layout["/dl"] = (2, 20 * GB)  # same free space, now its own filesystem
             for minutes in (30, 45):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
@@ -1191,7 +1260,8 @@ class RunCheckTest(unittest.TestCase):
             ("Media stack on h: 2 problems",
              "• disk: dropped below 25G free for the downloads\n"
              "• disk: dropped below 25G free for the library")])
-        self.assertEqual(state["disk"], {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+        self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 25 * GB},
+                                         "disk:downloads": {"device": 2, "level": 25 * GB}})
         self.assertEqual(set(state["tracked"]), {"disk:library", "disk:downloads"})
 
     def test_disk_check_is_off_by_the_setting(self):

@@ -67,11 +67,9 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("D14", 'if minimum < SIZE_UNITS["G"]:', 'if minimum < SIZE_UNITS["M"]:',
      "accepts a threshold of a few megabytes"),
     # --- the ratchet, which is what keeps a wobbling drive from spending the day's alerts
-    ("R1", "level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
-     "level = max([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
+    ("R1", "level = min([int(minimum * step)] + kept)", "level = max([int(minimum * step)] + kept)",
      "the ratchet runs backwards: the report only ever rises"),
-    ("R2", "level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
-     "level = int(minimum * step)",
+    ("R2", "level = min([int(minimum * step)] + kept)", "level = int(minimum * step)",
      "no ratchet, so a wobble across a step alternates and burns the daily cap"),
     ("R3", 'state["disk"] = {key: level for key, level in floors.items() if key in tracked}',
      'state["disk"] = {key: level for key, level in floors.items()}',
@@ -79,16 +77,46 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("R4", 'state["disk"] = {key: level for key, level in floors.items() if key in tracked}',
      'state["disk"] = {}',
      "the floor is dropped every run, so the ratchet never spans checks"),
-    ("R5", "[floors[key] for key in keys if key in floors]", "[floors.get(key, 0) for key in keys]",
+    ("R5", '        kept = [floor["level"] for key in keys\n'
+           '                if (floor := floors.get(key)) and floor.get("device") in (device, None)]',
+     '        kept = [floors.get(key, {}).get("level", 0) for key in keys]',
      "an unseen key floors at zero and reports a level nothing was ever under"),
     ("R6", 'floors = state.setdefault("disk", {})', "floors = {}",
      "run_check hands over a fresh floor each run"),
     # --- keying per role, so splitting or merging the watched paths doesn't retire a key
     ("K1", 'keys = [f"disk:{role}" for role in roles]', 'keys = [f"disk:{\'+\'.join(roles)}"]',
      "back to a role-set key, so moving downloads to its own drive invents a new problem"),
-    ("K2", "        for key in keys:\n            floors[key] = level",
-     "        for key in keys[:1]:\n            floors[key] = level",
+    ("K2", '        for key in keys:\n            floors[key] = {"device": device, "level": level}',
+     '        for key in keys[:1]:\n            floors[key] = {"device": device, "level": level}',
      "only the first role of a filesystem keeps a floor"),
+    # --- a floor belongs to a filesystem, not to a role that may move to another drive
+    ("V1", '(floor := floors.get(key)) and floor.get("device") in (device, None)',
+     "(floor := floors.get(key))",
+     "a floor follows a role onto a new drive and claims a level it was never under"),
+    ("V2", '(floor := floors.get(key)) and floor.get("device") in (device, None)',
+     '(floor := floors.get(key)) and floor.get("device") == device',
+     "an inherited floor with no device yet is thrown away, losing the reported low point"),
+    ("V3", 'floors[key] = {"device": device, "level": level}',
+     'floors[key] = {"device": None, "level": level}',
+     "the device is never recorded, so a floor can never be recognised as foreign"),
+    # --- migrating the old disk:library+downloads key
+    ("G1", "    migrate_disk_keys(state)\n", "\n",
+     "upgrading retires the key in front of the artifex and invents two, at top priority"),
+    ("G2", '            for role in key.removeprefix("disk:").split("+"):\n'
+           "                holder.setdefault(f\"disk:{role}\", value)",
+     '            for role in key.removeprefix("disk:").split("+")[:1]:\n'
+     "                holder.setdefault(f\"disk:{role}\", value)",
+     "only the first role of an old combined key is migrated"),
+    ("G3", "    for holder in (state.get(\"disk\"), state.get(\"tracked\"),\n"
+           "                   state.get(\"stack\", {}).get(\"shown\"), state.get(\"stack\", {}).get(\"reported\")):",
+     "    for holder in (state.get(\"disk\"), state.get(\"tracked\")):",
+     "shown isn't migrated, so the same key churn happens one layer down"),
+    ("G4", '            floors[key] = {"level": level}  # no device', '            floors[key] = {}  # no device',
+     "an inherited floor loses its level, so the ratchet restarts at the top step"),
+    # --- the abandoned read must not be able to hold up the interpreter's exit
+    ("T4", "    worker = threading.Thread(target=attempt, daemon=True)",
+     "    worker = threading.Thread(target=attempt, daemon=False)",
+     "a wedged read is joined at shutdown, which is the SIGTERM the timeout exists to prevent"),
     # --- the fallback Compose applies when SABNZBD_TEMP is blank
     ("F1", "path = configured or fallback", "path = configured",
      "a blank SABNZBD_TEMP watches nothing, while Compose still mounts its default"),

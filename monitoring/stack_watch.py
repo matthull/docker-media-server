@@ -641,19 +641,58 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
             problems[f"disk:{role}"] = f"disk: can't read free space for the {role} path"
             continue
         filesystems.setdefault(device, ([], free))[0].append(role)
-    for roles, free in filesystems.values():
+    for device, (roles, free) in filesystems.items():
         if free >= minimum:
             continue
         step = min(fraction for fraction in DISK_STEPS if free < minimum * fraction)
         keys = [f"disk:{role}" for role in roles]
+        # A floor belongs to a filesystem, not to a role, so it is stored with the device it was
+        # measured on and ignored once that changes. Keyed by role alone it would follow a role onto
+        # a different drive and keep reporting a level the new drive has never been under — silently
+        # and for as long as the problem lasts, since an unchanged description republishes nothing.
+        # That is the same falsehood the bytes-not-fractions choice below was made to avoid, arriving
+        # by another route. A floor with no device at all is one this version inherited from the
+        # last, and is honoured once before being stamped with the device it is really on.
+        kept = [floor["level"] for key in keys
+                if (floor := floors.get(key)) and floor.get("device") in (device, None)]
         # One floor for the filesystem, so roles that have just been merged onto it can't report two
         # different low points in two bullets for the same drive.
-        level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])
+        level = min([int(minimum * step)] + kept)
         description = f"disk: dropped below {size(level)} free for the {' and '.join(roles)}"
         for key in keys:
-            floors[key] = level
+            floors[key] = {"device": device, "level": level}
             problems[key] = description
     return problems
+
+
+def migrate_disk_keys(state: dict) -> None:
+    """Rewrite state written when a disk key carried the whole set of roles sharing a filesystem
+    (`disk:library+downloads`) into one key per role, and floors stored as a bare level into the
+    {device, level} form.
+
+    Without it the first run after this upgrade retires the key the artifex is already looking at and
+    introduces two he has never seen, which publish_stack can only read as new problems: a
+    rotating_light at the highest priority the system has, about a drive where nothing has happened.
+    Worse, the stored floor goes with the retired key, so if free space has recovered within the
+    episode the replacement is computed fresh at a *higher* step — the notification that arrives at
+    top priority carries better news than the one it replaces. Good news dressed as an emergency is
+    the bug 238199f was written to kill, reaching the same place from the other side.
+
+    `shown` and `reported` are migrated too: leaving them behind would produce exactly the same
+    key churn one layer down."""
+    for holder in (state.get("disk"), state.get("tracked"),
+                   state.get("stack", {}).get("shown"), state.get("stack", {}).get("reported")):
+        if not isinstance(holder, dict):
+            continue
+        for key in [k for k in holder if k.startswith("disk:") and "+" in k]:
+            value = holder.pop(key)
+            for role in key.removeprefix("disk:").split("+"):
+                holder.setdefault(f"disk:{role}", value)
+    floors = state.get("disk")
+    if isinstance(floors, dict):
+        for key, level in floors.items():
+            if not isinstance(level, dict):
+                floors[key] = {"level": level}  # no device: honoured once, then stamped
 
 
 def gather_problems(watch: Watch, floors: dict | None = None) -> dict[str, str]:
@@ -821,6 +860,7 @@ def heartbeat(watch: Watch, state: dict) -> None:
 
 def run_check(watch: Watch, state: dict) -> None:
     errors = []
+    migrate_disk_keys(state)
     previous = state.get("tracked", {})
     floors = state.setdefault("disk", {})
     try:
