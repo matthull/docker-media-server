@@ -301,8 +301,10 @@ fact in this file until they were checked against the running server:
   OpenAPI spec gives it exactly `metadataRefreshMode`, `imageRefreshMode`, `replaceAllMetadata`,
   `replaceAllImages`, `regenerateTrickplay`. `Recursive=true` — which
   [jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293) and every guide recommend —
-  is silently dropped by ASP.NET Core. The call works because a `FullRefresh` on a Series cascades
-  to its children, not because of that flag. `metadataRefreshMode=Default` is **not** sufficient.
+  is silently dropped by ASP.NET Core. What *is* established: the flag cannot be doing anything,
+  and `metadataRefreshMode=FullRefresh` on the series does heal the children. The mechanism is
+  presumably a parent-to-child cascade, but that part is inferred from the behaviour, not read out
+  of Jellyfin's source — treat it as unconfirmed.
 - **A full library scan is not a reliable repair.** A stranded series was observed surviving
   **two consecutive** `jellyfin-full-scan` runs unchanged, then healing ~20 s after a single
   `FullRefresh`. Do not reach for `POST /Library/Refresh` as the heavier-but-equivalent option; it

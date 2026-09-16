@@ -80,8 +80,10 @@ is correct there and meaningless inside a container.
    `regenerateTrickplay`. Guides — including
    [jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293) — tell you to send
    `Recursive=true`, and ASP.NET Core silently drops unknown query parameters, so that call is
-   really just a `FullRefresh`. The cascade from a Series to its children is what does the work,
-   and it needs `metadataRefreshMode=FullRefresh`; `Default` is not enough.
+   really just a `FullRefresh` — the flag cannot be doing anything. What is established by
+   measurement: `metadataRefreshMode=FullRefresh` on the *series* heals its children, and
+   `Default` does not. The mechanism is presumably a parent-to-child cascade, but that is inferred
+   from the behaviour rather than read out of Jellyfin's source, so do not repeat it as fact.
 2. **Refreshing too early achieves nothing**, because it re-reads the stale key. Hence the
    `REFRESH_DELAY` (60s by default) before the script looks at anything.
 

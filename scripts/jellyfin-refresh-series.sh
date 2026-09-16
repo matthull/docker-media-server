@@ -18,9 +18,10 @@
 # episode in ONE batch, so there is no second fire and nothing heals it. Sonarr prefers season
 # packs, which makes the unrecoverable case the common one. Left alone it takes ~36h.
 #
-# WHAT FIXES IT. A metadata FullRefresh on the series item. Jellyfin re-runs identification,
-# writes the current key to the series, and cascades to the children, which rewrites theirs.
-# Measured here: a stranded series heals ~20s after the POST.
+# WHAT FIXES IT. A metadata FullRefresh on the series item. Measured here: a stranded series heals
+# within ~5-20s of the POST, and `Default` instead of `FullRefresh` does not fix it. The mechanism
+# is presumably that the refresh cascades from the series to its children and rewrites their keys,
+# but that is inferred from the behaviour, not read out of Jellyfin's source.
 #
 # TWO TRAPS, both of which produce a call that returns 204 and does nothing:
 #
@@ -28,8 +29,8 @@
 #      spec accepts only metadataRefreshMode, imageRefreshMode, replaceAllMetadata,
 #      replaceAllImages and regenerateTrickplay. Guides (and jellyfin#17293) tell you to send
 #      Recursive=true; ASP.NET Core silently drops unknown query parameters, so that call is
-#      really just a FullRefresh, and the cascade to children is what was doing the work all
-#      along. Sending it does no harm but it explains nothing — do not "restore" it.
+#      really just a FullRefresh. Sending it does no harm but it explains nothing — do not
+#      "restore" it believing it is what makes the fix work.
 #   2. Refreshing too early re-reads the STALE key and achieves nothing. The refresh has to land
 #      after provider identification, hence REFRESH_DELAY below.
 #
