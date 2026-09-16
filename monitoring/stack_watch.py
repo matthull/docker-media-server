@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stack watch: the alerts this stack's services cannot send about themselves.
 
-  check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Seerr is
-           running without its download-tracker patch, Jellyfin stops answering, the drive the
-           library and downloads live on is running out of room, or Docker itself is down. Also keeps an ntfy dead man's switch scheduled that fires if
+  check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Seerr
+           is running without its download-tracker patch, Jellyfin stops answering, the drive
+           the library and downloads live on is running out of room, or Docker itself is down. Also keeps an ntfy dead man's switch scheduled that fires if
            this host stops checking in (asleep, powered off, offline).
   stalled  Daily. Alerts on monitored items Sonarr/Radarr still have no file for after
            STALL_DAYS. Nothing else reports this: a request can be accepted and then wait
@@ -620,7 +620,7 @@ def seerr_patch_problem(run: Run) -> str | None:
     tracker at all and not an empty or unrelated file."""
     try:
         source = run(["docker", "exec", SEERR_CONTAINER, "cat", SEERR_TRACKER], timeout=SEERR_EXEC_TIMEOUT)
-    except COMMAND_ERRORS as exc:
+    except (*COMMAND_ERRORS, UnicodeDecodeError) as exc:  # run_cmd decodes stdout as text
         print(f"seerr patch check failed: {exc}", file=sys.stderr)
         return "seerr: can't check its download-tracker patch (details in the journal)"
     if "getQueue" not in source:

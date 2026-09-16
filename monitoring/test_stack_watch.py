@@ -634,6 +634,17 @@ class SeerrPatchTest(unittest.TestCase):
                 self.assertEqual(list(sw.stack_problems(Path("/stack"), run)), ["service:seerr"])
                 self.assertEqual(execs(run), [])
 
+    def test_another_service_being_down_does_not_skip_the_check(self):
+        run = seerr_stack(container("sonarr", "exited", exit_code=1), container("seerr"), tracker=UNPATCHED_TRACKER)
+        self.assertEqual(sorted(sw.stack_problems(Path("/stack"), run)), ["seerr:patch", "service:sonarr"])
+
+    def test_undecodable_output_is_one_problem_not_a_failed_run(self):
+        """run_cmd decodes as text, and UnicodeDecodeError is a ValueError, not a COMMAND_ERROR."""
+        garbled = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=garbled)),
+                             "seerr: can't check its download-tracker patch (details in the journal)")
+
     def test_a_stack_without_seerr_is_not_asked_about_it(self):
         config = json.dumps({"name": "proj", "services": {"sonarr": {}}})
         run = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER, config=config)
@@ -1657,6 +1668,14 @@ class RunCheckTest(unittest.TestCase):
             sent += self.check(state, stopped, minutes * MIN)
         self.assertEqual([m["message"] for m in sent], [f"• seerr: exited (code 137)\n• {self.UNPATCHED}"])
         self.assertEqual(execs(stopped), [])
+
+    def test_a_stopped_seerr_with_no_patch_history_is_just_a_stopped_service(self):
+        stopped = seerr_stack(container("sonarr"), container("seerr", "exited", exit_code=137))
+        state = {}
+        for minutes in (0, 15):
+            sent = self.check(state, stopped, minutes * MIN)
+        self.assertEqual([m["message"] for m in sent], ["• seerr: exited (code 137)"])
+        self.assertNotIn("seerr:patch", state["tracked"])
 
     def test_unexpected_error_gathering_problems_still_reschedules_the_heartbeat(self):
         state, http = {}, FakeHttp()
