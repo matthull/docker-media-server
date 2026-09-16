@@ -124,6 +124,27 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("T4", "    worker = threading.Thread(target=attempt, daemon=True)",
      "    worker = threading.Thread(target=attempt, daemon=False)",
      "a wedged read is joined at shutdown, which is the SIGTERM the timeout exists to prevent"),
+    ("T5", "DISK_READ_TIMEOUT = 20", "DISK_READ_TIMEOUT = 2000",
+     "33 minutes for one path, well past the unit's TimeoutStartSec"),
+    # --- a filesystem that can never satisfy the threshold, which Compose's fallback usually is
+    ("F5", "        if not configured and total < minimum:", "        if False:",
+     "a few-gigabyte tmpfs alerts forever on the same notification as the real library-full alert"),
+    ("F6", "        if not configured and total < minimum:", "        if total < minimum:",
+     "a path the user configured is second-guessed and silently not watched"),
+    ("F4", '("MEDIA_ROOT", "library", None)', '("MEDIA_ROOT", "library", "/tmp")',
+     "MEDIA_ROOT gains a fallback Compose doesn't apply, so an unset one watches the wrong drive"),
+    # --- the re-send's cadence and its one chance to say something false
+    ("N6", "STACK_REPEAT = timedelta(days=1)", "STACK_REPEAT = timedelta(days=7)",
+     "the cadence is retuned to a week and the re-send still fires daily"),
+    # N7 pins what makes STACK_REPEAT real. It is the pruning window, not a comparison: the clause
+    # that looked like the cadence was dead code, and this mutant surviving is what proved it.
+    ("N7", "                  if now - t < max(day, STACK_REPEAT))", "                  if now - t < day)",
+     "the re-send window is pinned at a day, so raising STACK_REPEAT changes nothing"),
+    ("N8", "min([t for t in started if t], default=None)",
+     "max([t for t in started if t], default=None)",
+     "'First seen' names the newest problem in the set instead of the oldest"),
+    ("N9", "current and not going and not sent", "current and not sent",
+     "a problem that has already gone is re-sent as 'still not resolved'"),
     # --- the fallback Compose applies when SABNZBD_TEMP is blank
     ("F1", "path = configured or fallback", "path = configured",
      "a blank SABNZBD_TEMP watches nothing, while Compose still mounts its default"),
@@ -142,11 +163,8 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "        except FileNotFoundError as exc:\n            if not configured:",
      "a timed-out read escapes instead of reading as an unreadable path"),
     # --- re-sending a standing problem, so it isn't announced once and then never again
-    ("N1", "    if unchanged and not (current and (not sent or now - sent[-1] >= STACK_REPEAT)):",
-     "    if unchanged:",
+    ("N1", "    if unchanged and not (current and not going and not sent):", "    if unchanged:",
      "a problem is announced exactly once, ever, however long it lasts"),
-    ("N2", "now - sent[-1] >= STACK_REPEAT))", "now - sent[-1] >= timedelta(0)))",
-     "the re-nudge has no cadence, so it repeats as often as the spacing allows"),
     ("N3", "    fresh = bool(current.keys() - shown.keys() - reported.keys())",
      "    fresh = bool(current)",
      "a flapping problem's return overrides the cap that protects the shared ntfy budget"),

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -465,13 +466,16 @@ class JellyfinTest(unittest.TestCase):
                 self.assertIn("SENTINEL", log.getvalue())  # it went to the journal instead
 
 def free_space(*known):
-    """A fake filesystem_free: (path, (device, bytes free)) pairs. Any other path is unreadable."""
+    """A fake filesystem_free: (path, (device, bytes free)) pairs, or (device, free, total) to say
+    how big the filesystem is. Any other path is unreadable. Defaults to a drive comfortably larger
+    than any threshold used here, so only the tests that care about size have to say so."""
     paths = dict(known)
 
     def reader(path):
         if path not in paths:
             raise OSError(2, "No such file or directory")
-        return paths[path]
+        answer = paths[path]
+        return answer if len(answer) == 3 else (*answer, 4096 * GB)
     return reader
 
 
@@ -486,13 +490,13 @@ class Drive:
     back to Compose's default when it isn't configured, and a drive that answered for every path
     would quietly pull that second role into every test here."""
 
-    def __init__(self, free, at="/lib"):
-        self.free, self.at = free, at
+    def __init__(self, free, at="/lib", total=4096 * GB):
+        self.free, self.at, self.total = free, at, total
 
     def __call__(self, path, timeout=None):
         if path != self.at:
             raise OSError(2, "No such file or directory")
-        return 1, self.free
+        return 1, self.free, self.total
 
 
 @contextlib.contextmanager
@@ -621,10 +625,16 @@ class DiskTest(unittest.TestCase):
         self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": ""}, 100 * GB, {}, reader),
                          {"disk:downloads": "disk: dropped below 10G free for the downloads"})
 
-    def test_the_downloads_fallback_is_the_one_docker_compose_applies(self):
+    def test_the_fallbacks_are_exactly_the_ones_docker_compose_applies(self):
+        """Both directions. MEDIA_ROOT is a bare ${MEDIA_ROOT} in Compose, so inventing a fallback
+        for it would mean an unset one silently watched some other filesystem and called it the
+        library."""
         compose = (Path(sw.__file__).parent.parent / "docker-compose.yml").read_text()
-        self.assertEqual({key: fallback for key, _, fallback in sw.DISK_ROLES}["SABNZBD_TEMP"],
+        fallbacks = {key: fallback for key, _, fallback in sw.DISK_ROLES}
+        self.assertEqual(fallbacks["SABNZBD_TEMP"],
                          re.search(r"\$\{SABNZBD_TEMP:-([^}]+)\}", compose)[1])
+        self.assertIsNone(fallbacks["MEDIA_ROOT"])
+        self.assertNotIn("${MEDIA_ROOT:-", compose)
 
     def test_a_fallback_path_that_is_not_there_is_not_a_problem(self):
         """A configured path that can't be read is the user's claim about their disk, so it is
@@ -719,10 +729,43 @@ class DiskTest(unittest.TestCase):
         self.assertEqual(floors["disk:library"], {"device": 4, "level": 10 * GB})
 
     def test_a_readable_filesystem_is_not_slowed_down_by_the_timeout(self):
-        self.assertEqual(sw.filesystem_free("/lib", read=lambda path: (7, 3 * GB)), (7, 3 * GB))
+        began = time.monotonic()
+        self.assertEqual(sw.filesystem_free("/lib", read=lambda path: (7, 3 * GB, 9 * GB)),
+                         (7, 3 * GB, 9 * GB))
         with self.assertRaises(OSError) as caught:  # a real error still arrives as itself
             sw.filesystem_free("/lib", read=raises(OSError(2, "No such file or directory")))
         self.assertEqual(caught.exception.errno, 2)
+        self.assertLess(time.monotonic() - began, 1)  # the name promises this; assert it
+
+    def test_the_disk_reads_fit_inside_the_units_start_timeout(self):
+        """The disk is read after the containers and Jellyfin, so its timeout is spent on top of
+        theirs, and overrunning TimeoutStartSec is the SIGTERM-without-saving-state this was written
+        to prevent. Ties the constants to the unit the installer writes, the way ScheduleTest ties
+        the cadence to the timer."""
+        installer = Path(sw.__file__).with_name("install-stack-watch.sh").read_text()
+        [limit] = re.findall(r"^TimeoutStartSec=(\d+)min$", installer, re.MULTILINE)
+        worst = (3 * 60  # docker compose config, docker ps, docker inspect, at run_cmd's timeout
+                 + 10  # jellyfin
+                 + len(sw.DISK_ROLES) * sw.DISK_READ_TIMEOUT
+                 + 3 * 20)  # the stack, heartbeat and failure ntfy publishes, at http_request's
+        self.assertLess(worst, int(limit) * 60,
+                        f"a worst-case check takes {worst}s against a {limit}min limit")
+
+    def test_a_fallback_filesystem_too_small_for_the_threshold_is_not_watched(self):
+        """Compose's fallback is usually /tmp, a tmpfs of a few gigabytes, and DISK_FREE_MIN is sized
+        for the media library. Watching it would be a standing alert nobody can ever clear — on the
+        same ntfy sequence_id as the real library-full alert, so it would train the artifex to swipe
+        away the one notification this whole check exists to deliver."""
+        reader = free_space(("/lib", (1, 500 * GB)), ("/tmp/sabnzbd-temp", (2, 5 * GB, 16 * GB)))
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "/lib"}, 100 * GB, {}, reader), {})
+        self.assertIn("SABNZBD_TEMP", log.getvalue())
+
+    def test_a_configured_filesystem_too_small_for_the_threshold_is_still_the_users_claim(self):
+        """Only the inferred fallback is second-guessed. A path the user named is watched as asked."""
+        reader = free_space(("/dl", (1, 5 * GB, 16 * GB)))
+        self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": "/dl"}, 100 * GB, {}, reader),
+                         {"disk:downloads": "disk: dropped below 10G free for the downloads"})
 
     def test_a_timed_out_filesystem_reads_as_unreadable_and_leaks_no_path(self):
         def wedged(path, timeout=None):
@@ -867,6 +910,40 @@ class PublishStackTest(unittest.TestCase):
                          ("Media stack on h: 1 problem", sw.DEFAULT, ["warning"]))
         self.assertEqual(sent["message"], f"• {shown['disk:library']}\n\nStill not resolved. "
                                           f"First seen {sw.when(NOW - 3 * DAY)}.")
+
+    def test_first_seen_names_the_oldest_problem_in_the_set(self):
+        """min, not max: with a disk problem three weeks old beside a container that died yesterday,
+        the set has been there three weeks."""
+        shown = {"a": "a: exited", "b": "b: unhealthy"}
+        self.http = FakeHttp()
+        sw.publish_stack(make_watch(http=self.http), {
+            "a": {"alerted": True, "description": "a: exited", "first": (NOW - 21 * DAY).isoformat()},
+            "b": {"alerted": True, "description": "b: unhealthy", "first": (NOW - DAY).isoformat()},
+        }, {"shown": dict(shown), "sent": [(NOW - 2 * DAY).isoformat()]})
+        self.assertIn(f"First seen {sw.when(NOW - 21 * DAY)}.", self.http.published()[0]["message"])
+
+    def test_a_problem_on_its_way_out_is_not_re_sent_as_still_not_resolved(self):
+        """advance holds a problem alerted through one absent run, so `current` can still name
+        something that has just gone. Re-sending "still not resolved" about it would be the one case
+        where the re-send makes a false claim about the world — and the all clear is one run behind
+        it anyway."""
+        self.http = FakeHttp()
+        stack = {"shown": {"a": "a: exited"}, "sent": [(NOW - 2 * DAY).isoformat()]}
+        new = sw.publish_stack(make_watch(http=self.http), {
+            "a": {"alerted": True, "description": "a: exited", "absent": 1,
+                  "first": (NOW - 3 * DAY).isoformat()}}, stack)
+        self.assertEqual((self.http.published(), new), ([], stack))
+
+    def test_raising_the_repeat_interval_actually_raises_it(self):
+        """`sent` used to be pruned at a day flat, so the STACK_REPEAT comparison could never be the
+        reason a re-send fired — it always went through the empty-list branch, and the constant was
+        decoration. A test reading sw.STACK_REPEAT passed for any value, which is the same
+        right-outcome-wrong-mechanism shape as the cap test this replaced."""
+        shown = {"a": "a: exited"}
+        stack = {"shown": dict(shown), "sent": [NOW.isoformat()]}
+        with unittest.mock.patch.object(sw, "STACK_REPEAT", 7 * DAY):
+            self.assertEqual(self.publish(dict(shown), stack, now=NOW + 3 * DAY)[1], [])
+            self.assertEqual(len(self.publish(dict(shown), stack, now=NOW + 7 * DAY)[1]), 1)
 
     def test_a_repeat_of_state_too_old_to_know_when_it_started_still_says_it_is_a_repeat(self):
         """A stack record written before this change has no "first", and a bare re-send of the same
@@ -1266,13 +1343,13 @@ class RunCheckTest(unittest.TestCase):
         state = {"disk": {}}
         cfg = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl", "DISK_FREE_MIN": "100G"}
         healthy, sent = docker(container("sonarr"), container("radarr")), []
-        layout = {"/lib": (1, 20 * GB), "/dl": (1, 20 * GB)}
+        layout = {"/lib": (1, 20 * GB, 4096 * GB), "/dl": (1, 20 * GB, 4096 * GB)}
         with mounted(lambda path: layout[path]):
             for minutes in (0, 15):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
             self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 25 * GB},
                                              "disk:downloads": {"device": 1, "level": 25 * GB}})
-            layout["/dl"] = (2, 20 * GB)  # same free space, now its own filesystem
+            layout["/dl"] = (2, 20 * GB, 4096 * GB)  # same free space, now its own filesystem
             for minutes in (30, 45):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
         self.assertEqual([(m["title"], m["message"]) for m in sent], [

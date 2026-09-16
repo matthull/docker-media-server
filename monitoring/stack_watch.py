@@ -568,13 +568,15 @@ def disk_minimum(cfg: dict) -> int | None:
     return minimum
 
 
-def read_free(path: str) -> tuple[int, int]:
+def read_free(path: str) -> tuple[int, int, int]:
     stat = os.statvfs(path)
-    return os.stat(path).st_dev, stat.f_bavail * stat.f_frsize
+    return os.stat(path).st_dev, stat.f_bavail * stat.f_frsize, stat.f_blocks * stat.f_frsize
 
 
-def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT, read=read_free) -> tuple[int, int]:
-    """(which filesystem, bytes on it this user may still write) for the filesystem holding path.
+def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT,
+                    read=read_free) -> tuple[int, int, int]:
+    """(which filesystem, bytes this user may still write, its total size) for the filesystem
+    holding path.
 
     The read happens on a thread that is abandoned if it takes longer than `timeout`, because the
     calls it makes have no timeout of their own and a spun-down, failing or stale network mount
@@ -634,7 +636,7 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
         if not path:
             continue
         try:
-            device, free = free_space(path)
+            device, free, total = free_space(path)
         except OSError as exc:
             if not configured:
                 # Compose's fallback, which it only creates on `up`. Not the user's claim about
@@ -643,6 +645,16 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
                 continue
             print(f"can't read free space for {setting}: {exc}", file=sys.stderr)
             problems[f"disk:{role}"] = f"disk: can't read free space for the {role} path"
+            continue
+        if not configured and total < minimum:
+            # A filesystem smaller than the threshold can never satisfy it, so watching it would be a
+            # standing alert nobody can clear — and it shares one ntfy sequence_id with the real
+            # library-full alert, so it would train the artifex to swipe away the one notification
+            # this whole check exists to deliver. Compose's fallback is usually /tmp, a tmpfs of a few
+            # gigabytes against a threshold sized for the media library. A path the user configured is
+            # their own claim about their disk and is left alone; this one the script inferred.
+            print(f"not watching {setting}'s fallback: {size(total)} filesystem can't hold "
+                  f"{size(minimum)} free", file=sys.stderr)
             continue
         filesystems.setdefault(device, ([], free))[0].append(role)
     for device, (roles, free) in filesystems.items():
@@ -773,12 +785,23 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     now, day = watch.now, timedelta(days=1)
     current = {key: entry["description"] for key, entry in tracked.items() if entry["alerted"]}
     shown = stack.get("shown", {})
-    sent = sorted(t for t in map(parse_ts, stack.get("sent", [])) if now - t < day)
+    # Kept for the daily cap's window or the re-send's, whichever is longer. Pruned at a day flat,
+    # raising STACK_REPEAT above a day would do nothing at all: every entry would age out before the
+    # comparison below could be false, so the re-send would fire daily whatever the constant said.
+    sent = sorted(t for t in map(parse_ts, stack.get("sent", []))
+                  if now - t < max(day, STACK_REPEAT))
     # An unchanged set of problems is re-sent every STACK_REPEAT, so a standing problem isn't a
-    # single notification the artifex may have dismissed long ago. `sent` is already pruned to the
-    # last day, so an empty one means nothing has gone out in at least that long.
+    # single notification the artifex may have dismissed long ago. An empty `sent` means nothing has
+    # gone out within either window.
     unchanged = current == shown
-    if unchanged and not (current and (not sent or now - sent[-1] >= STACK_REPEAT)):
+    # `advance` holds a problem alerted through one absent run, so `current` can still hold something
+    # that has in fact just gone; re-sending "still not resolved" about it would be false, and the
+    # all clear is one run behind it anyway.
+    going = any(entry.get("absent") for key, entry in tracked.items() if key in current)
+    # `sent` is pruned at exactly the re-send window, so an empty one already means "nothing has gone
+    # out within STACK_REPEAT". Comparing against sent[-1] as well reads like the cadence but cannot
+    # ever be the reason — that clause was dead code, and a mutation test is what proved it.
+    if unchanged and not (current and not going and not sent):
         return stack
     reported = {k: t for k, t in ((k, parse_ts(v)) for k, v in stack.get("reported", {}).items())
                 if now - t < day}

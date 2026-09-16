@@ -21,7 +21,7 @@ new account.
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
 | **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new or worse, else Default |
-| **… (re-sent)** | The same problems are still unresolved a day later | Default |
+| *(the same notification, re-sent)* | The same problems are still unresolved a day later. Not a separate alert — same title, replaced in place | Default |
 | **… all clear** | Everything above has been fine for two checks. Names what recovered | Low |
 | ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
 | ***host* is back online** | The first check after "unreachable" went out | Default |
@@ -37,10 +37,12 @@ new account.
   a filesystem are worded as one (`disk: dropped below 50G free for the library and downloads`); paths
   on separate drives get one line each. Leaving `SABNZBD_TEMP` blank does **not** mean the downloads
   filesystem goes unwatched: `docker-compose.yml` mounts `${SABNZBD_TEMP:-/tmp/sabnzbd-temp}`, so the
-  check follows it to the same place. That default is usually a tmpfs of a few gigabytes, well under
-  SABnzbd's own `download_free`, so if you leave it blank and the directory exists you should expect
-  a standing downloads alert — SABnzbd really would stop there. If the directory doesn't exist,
-  nothing is watched and nothing is said. It reports the *lowest* step the drive has been under since the
+  check follows it to the same place — unless that filesystem is smaller than `DISK_FREE_MIN`, which
+  the usual `/tmp` tmpfs is. It could never have that much free, so watching it would be a standing
+  alert nobody can clear, on the same notification as the real library-full one; it is skipped with a
+  line in the journal instead. A path you configured yourself is always watched as asked, whatever
+  its size. If the fallback directory doesn't exist, nothing is watched and nothing is said.
+  It reports the *lowest* step the drive has been under since the
   problem began — `DISK_FREE_MIN`, then half, a quarter and a tenth of it — never the figure itself,
   and never moving back up until the all clear releases it. That is why it says "dropped below": free
   space rising past a step again doesn't make the sentence untrue, so there is nothing to republish.

@@ -75,12 +75,16 @@ def run(free_series, ratchet=True):
 def _run(free_series, ratchet, http, state, original):
     try:
         for index, free in enumerate(free_series):
-            sw.filesystem_free = lambda path, _f=free: (1, _f)
+            sw.filesystem_free = lambda path, _f=free: (1, _f, 4096 * GB)
             if not ratchet:
                 state.pop("disk", None)  # the floor is what makes it a ratchet
             watch = sw.Watch({"STACK_DIR": "/stack", "JELLYFIN_URL": "off",
                               "HEARTBEAT_GRACE": "off", "MEDIA_ROOT": "/lib",
-                              "DISK_FREE_MIN": "100G"},
+                              # Both roles, one drive, as on the host this was measured against —
+                              # said explicitly so the "library and downloads" wording in the output
+                              # describes a configuration the simulation actually set up, rather than
+                              # the SABNZBD_TEMP fallback wandering in.
+                              "SABNZBD_TEMP": "/lib", "DISK_FREE_MIN": "100G"},
                              sw.Notifier("https://ntfy.invalid", "t", http),
                              START + timedelta(minutes=15 * index), http, healthy_docker, "h", "h")
             sw.run_check(watch, state)
