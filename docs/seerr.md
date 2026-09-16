@@ -198,8 +198,14 @@ Confirmed at the protocol level too: the arrs' command history shows Seerr's `tr
 `RefreshMonitoredDownloads` stopping at the exact cycle the patched container started, with only
 `trigger=scheduled` after it.
 
-**Still unobserved:** nobody has yet watched a progress bar render in Seerr for a real in-flight
-download. Errors disappearing is not the same as progress appearing, and that link is inferred.
+A real movie request landed while this was being verified, and the patched tracker read the
+**non-empty** queue (`Found 1 item(s) in progress on Radarr server`), with `GET /api/v1/request`
+returning the populated `media.downloadStatus` the request card renders from — release name,
+`status=downloading`, size, `timeLeft`, ETA.
+
+**Still unobserved:** nobody has yet watched a progress bar in a *browser*, and that sample was
+caught at ~100%, so a changing percentage was never watched either. The data path is now observed;
+the rendering is still inferred.
 
 **Keep `apiRequestTimeout` at 45000 anyway.** It no longer protects the download tracker, but it
 covers every *other* Seerr→arr call that takes the write lock — notably adding a newly approved
