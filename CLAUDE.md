@@ -58,6 +58,7 @@ scripts/
   install-jellyfin-refresh.sh       # Installs the above into sonarr + registers the connector
   test_jellyfin_refresh.py          # python3 -m unittest discover -s scripts
   mutate_jellyfin_refresh.py        # Mutation check for the above; every mutant must be killed
+  check_doc_links.py                # Every README/docs link resolves in the repo tree
 docs/                               # Per-service setup guides
 .env.example                        # TZ, PUID/PGID, MEDIA_ROOT, CONFIG_ROOT, SABNZBD_TEMP, TS_AUTHKEY, stack watch
 ```
@@ -70,7 +71,9 @@ hang off Compose profiles in the core file (`cloudflared` is the pattern), not a
 
 `docs/` is the only place the guides are published. Link to them as files — `docs/sonarr.md` from
 the README, `sonarr.md#anchor` between guides — never as a wiki URL or a bare wiki page name
-(`(Sonarr)`). Bare names only resolve inside a GitHub wiki, and this fork has none. The upstream
+(`(Sonarr)`). Bare names only resolve inside a GitHub wiki, and this fork has none.
+`python3 scripts/check_doc_links.py` checks every link and anchor in README and `docs/`; run it
+after touching either. The upstream
 `bcanfield/docker-media-server` wiki lacks every fork-only page (Jellyfin Library Updates, Stack
 Watch) and its other pages describe upstream's stack.
 
@@ -83,7 +86,9 @@ and this fork's default token is read-only. So as configured, it would fail on e
 the token write access and it would succeed instead: every push would put someone else's name
 on a commit, and every local push after it would be rejected as behind. Publishing the wiki would
 also need its first page created in the web UI, which the action requires whatever its strategy.
-The Wiki tab is still enabled, so a visitor who opens it finds only an empty wiki.
+The Wiki tab is still enabled, so a visitor who opens it finds only an empty wiki. Links that leave
+`docs/` (`../images/seerr/README.md`) are not rewritten by the action and would break in a
+published wiki.
 
 ### Local, untracked files
 
