@@ -90,10 +90,24 @@ This cannot produce an *unpatched* Seerr — the image reused is the patched one
 base stale indefinitely with everything reporting healthy. It matters because
 `docker compose pull && docker compose up -d --pull always` is a common stock update recipe.
 
-**Update this stack with a plain `docker compose up -d`.** Nothing in the image asserts the patch at
-runtime: Seerr's healthcheck (`/api/v1/status`) passes identically on an unpatched image. The check
-that closes this is `docker exec seerr grep -c refreshMonitoredDownloads /app/dist/lib/downloadtracker.js`
-returning 0, which belongs in `monitoring/stack_watch.py` and is not there yet.
+**Update this stack with a plain `docker compose up -d`.** Nothing detects a stale base: the check
+below proves the patch is *present*, and a stale image still has it.
+
+### The runtime check
+
+Seerr's healthcheck (`/api/v1/status`) passes identically on an unpatched image, so the build guards
+above are the only thing between the patch and a silent revert — unless something reads the running
+container. `monitoring/stack_watch.py` does, every 15 minutes: it reads
+`/app/dist/lib/downloadtracker.js` out of `seerr` and alerts `seerr: running without its
+download-tracker patch` if `refreshMonitoredDownloads` is anywhere in it. That is the backstop for the
+ways around the build rather than through it — an `image:` key put back, an override pointing at
+upstream, a container started by hand. It also alerts if the file can't be read, or has no `getQueue`
+call (the patch is an absence, and an empty file has that too). It is skipped while `seerr` is
+already reported stopped or unhealthy, and keeps its last state then rather than calling the patch
+fixed. See [docs/stack-watch.md](../../docs/stack-watch.md).
+
+It deliberately does not use `grep -c`: grep exits 1 exactly when the count is the `0` that means
+patched, which the watch's command runner cannot tell from a failed `docker exec`.
 
 ## Verifying
 

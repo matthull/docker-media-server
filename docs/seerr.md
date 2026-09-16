@@ -195,7 +195,11 @@ every container still reporting healthy. Three things make that impossible here,
   actually reaches the container instead of sitting unused. **Not absolute:** `up -d --pull always`
   and `up -d --no-build` both skip the build silently and keep the old image running (verified, exit
   0, no warning). That yields a stale base, never an unpatched Seerr — but update with a plain
-  `docker compose up -d`, and note that nothing asserts the patch at runtime yet.
+  `docker compose up -d`, because nothing detects a stale base.
+
+An unpatched Seerr, reached some other way (an `image:` key put back, an override pointing at
+upstream), *is* detected: [stack watch](stack-watch.md) reads the tracker out of the running container
+every 15 minutes and alerts if the call is back.
 
 Dropping the write is safe because **both arrs already run `RefreshMonitoredDownloads` themselves
 every 1 minute** (`GET /api/v3/system/task`), the same cadence as Seerr's own Download Sync job.

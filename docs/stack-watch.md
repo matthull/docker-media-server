@@ -10,9 +10,12 @@ themselves:
 - a request Sonarr or Radarr accepted and then waits on forever, because no release ever turns up.
   Seerr has no event for this, so it just sits there;
 - the drive filling up. SABnzbd pauses downloading once free space reaches its `download_free`, and
-  nothing tells anyone why: requests simply stop arriving.
+  nothing tells anyone why: requests simply stop arriving;
+- Seerr running without the patch its image is built with
+  ([images/seerr](../images/seerr/README.md)). Its healthcheck passes either way, and without the patch
+  a requester's progress bar freezes during the very download they are waiting on.
 
-`monitoring/stack_watch.py` covers all five. It sends to the same ntfy topic as everything else.
+`monitoring/stack_watch.py` covers all six. It sends to the same ntfy topic as everything else.
 It is one standard-library Python script run by two systemd user timers, with no new container and no
 new account.
 
@@ -33,6 +36,13 @@ new account.
   `/health` not saying `Healthy`; less than `DISK_FREE_MIN` free where the library or the downloads
   live; Docker not answering; or a Compose file that can't be read. While Docker isn't answering,
   services keep the state they last had rather than being counted as recovered.
+- **The Seerr patch problem** reads `/app/dist/lib/downloadtracker.js` out of the running `seerr`
+  container (`docker exec`, 5s timeout) and says `seerr: running without its download-tracker patch`
+  if `refreshMonitoredDownloads` is in it. A read that fails, or a file with no `getQueue` call in it,
+  is its own problem, since the patch is an absence and an empty file has that too. It is only asked
+  when the Compose project has a `seerr` service that isn't already reported as stopped or unhealthy —
+  one problem, not two, for a stopped container — and while that, or Docker being down, stops it being
+  asked, it keeps its last state instead of being counted as fixed.
 - **The disk problem** reads the filesystems behind `MEDIA_ROOT` and `SABNZBD_TEMP`. Paths that share
   a filesystem are worded as one (`disk: dropped below 50G free for the library and downloads`); paths
   on separate drives get one line each. Leaving `SABNZBD_TEMP` blank does **not** mean the downloads
@@ -342,6 +352,31 @@ Run these from the repo root, one step at a time.
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
+10. **Seerr without its patch.** Never unpatch the real `seerr` to test this. Put the call back into
+    a throwaway container from the same image, and point only the check's `docker exec` at it. The
+    image is named after the Compose project; `docker inspect seerr --format '{{.Config.Image}}'`
+    prints it.
+
+    ```bash
+    docker run -d --name seerr-negctl --network none --entrypoint sleep docker-media-server-seerr 600
+    docker exec -u root seerr-negctl sed -i \
+      's/^\( *\)const queueItems = await radarr.getQueue();/\1await radarr.refreshMonitoredDownloads();\n&/' \
+      /app/dist/lib/downloadtracker.js
+    cat > /tmp/negctl.py <<'EOF'
+    import os, sys
+    sys.path.insert(0, "monitoring")
+    import stack_watch as sw
+    def run(argv, **kw):
+        if argv[:3] == ["docker", "exec", sw.SEERR_CONTAINER]:
+            argv = ["docker", "exec", "seerr-negctl", *argv[3:]]
+        return sw.run_cmd(argv, **kw)
+    sys.exit(sw.main(["check", "--test"], environ=dict(os.environ, HEARTBEAT_GRACE="off"), run=run))
+    EOF
+    python3 /tmp/negctl.py   # x2: "TEST: … 1 problem", "seerr: running without its download-tracker patch"
+    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test   # x2: "… all clear"
+    docker rm -f seerr-negctl
+    ```
+
 The daily re-send is deliberately not forceable this way: `--test` drops the spacing *between*
 different alerts, and giving it a zero re-send interval too would make every repeated `--test` check
 in the steps above publish a duplicate. If you do need to see one, run step 5's first two commands,
@@ -384,6 +419,9 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
 - **A drive that failed to mount.** An unmounted mount point is an ordinary empty directory, so the
   disk check reports the filesystem underneath it and sees plenty of room, and nothing here says
   otherwise. Worth knowing when `MEDIA_ROOT` moves onto its own drive.
+- **Seerr on a stale base.** `docker compose up -d --pull always` or `--no-build` keeps running the
+  last built image, which still has the patch, so the Seerr check passes. It proves the patch is
+  there, not that the image is current. See [images/seerr](../images/seerr/README.md).
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
 - **An inferred fallback that becomes too small for the threshold while it is already a problem.**

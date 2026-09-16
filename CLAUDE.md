@@ -47,7 +47,7 @@ backup/
   install-restic-timer.sh           # Daily systemd timer for the above
   .env.example                      # Restic credentials (off-site only)
 monitoring/
-  stack_watch.py                    # ntfy alerts for dead containers, host offline, stalled requests
+  stack_watch.py                    # ntfy alerts for dead containers, host offline, stalled requests, unpatched Seerr
   test_stack_watch.py               # python3 -m unittest discover -s monitoring
   install-stack-watch.sh            # systemd --user timers for the above; see docs/stack-watch.md
 images/
@@ -377,8 +377,10 @@ design working: read the new `downloadtracker.js` and update the `sed`, don't by
 
 **Update this stack with a plain `docker compose up -d`.** `--pull always` and `--no-build` both skip
 the build silently (exit 0, no warning) and keep the old image, which leaves `seerr` on a stale base
-with everything reporting healthy. Nothing asserts the patch at runtime — Seerr's healthcheck passes
-identically on an unpatched image.
+with everything reporting healthy, and nothing detects that. An *unpatched* Seerr is detected:
+Seerr's healthcheck passes identically without the patch, so `monitoring/stack_watch.py` reads
+`downloadtracker.js` out of the running container and alerts if the call is back (key `seerr:patch`).
+Keep its `SEERR_TRACKER` and the compose `container_name` in step with the build; a test ties them.
 
 `prowlarr` is deliberately on a `-nightly` tag — moving to stable is a **downgrade across a database
 migration**, which Prowlarr does not support and which needs a restore from
