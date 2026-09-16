@@ -194,6 +194,17 @@ weeks looking like residue.
 **Sonarr's `RenameSeries` renames files only, not the series folder.** To apply `seriesFolderFormat`
 to existing series: `PUT /series/editor {seriesIds, rootFolderPath:'/data/complete/tv', moveFiles:true}`.
 
+**Seerr never marks a TV request available from Jellyfin — only the Sonarr Scan can.** Its 5-minute
+recently-added scan reads `GET /Items/Latest`, which returns `Type=Episode` for a TV library, and
+`processItem()` handles `Movie`/`Series` only and drops the rest with no log line. The signature is a
+`Beginning to process recently added for library: TV Shows` immediately followed by
+`Recently Added Scan Complete` with no per-title line, while Movies logs one. Movies flip in 60s; TV
+sits at "Processing" until the daily full scan. Fix is the **Sonarr Scan at `0 */5 * * * *`**, which
+derives availability from Sonarr alone and completes the request in the same write. Unfixed upstream
+in both projects and unaffected by Jellyfin version — do not go looking for an upgrade. Full
+reasoning, the brand-new-series hierarchy bug it also sidesteps, and the library-size ceiling are in
+[docs/seerr.md](./docs/seerr.md).
+
 **Bazarr provider reality (1.6.0):** `podnapisi` was removed upstream and is silently dropped from
 `enabled_providers` on restart; `subsource` needs an API key and throttles with `ConfigurationError`
 without one; `subf2m` needs a `user_agent` or fails identically, forever. Enabled and healthy here:
