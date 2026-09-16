@@ -49,23 +49,36 @@ change the frequency of these jobs. Sonarr/radarr scan job will mark them availa
 one has documented running it at a short interval, so treat the cadence as sanctioned but not
 well-trodden.
 
-**Order matters, and it is self-correcting.** Once a season row reaches Available, no later scan can
-downgrade it — the scanner short-circuits on the stored status. A Jellyfin scan that runs *first* on
-a new series can knock a season from Processing back to Unknown, but the next Sonarr Scan restores
-it within 5 minutes.
+**Order matters, and it should be self-correcting.** Reading the scanner source, an Available season
+row cannot be downgraded by a later scan — the status expression short-circuits on the stored value,
+so every downgrade arm is unreachable once a season reaches Available. A Jellyfin scan that runs
+*first* on a new series can knock a season from Processing back to Unknown, but the next Sonarr Scan
+should restore it within 5 minutes. **This is a source read, not an observation** — no run here has
+yet put a Jellyfin scan against a series whose hierarchy was still broken at the moment it ran, so
+the guard has not been watched doing its job. Treat it as well-founded but unproven.
 
 **Known gap:** the Sonarr Scan does not set `jellyfinMediaId`, so a brand-new title reads Available
 with no "Play on Jellyfin" link until a Jellyfin scan runs (nightly by default). Availability is
 correct throughout; only the deep link is missing.
 
 **Do not raise this past ~1,000 series without re-timing it.** Each run walks *every* series with no
-change detection, paced at roughly `ceil(series / 50) × 4s` — about 4s at small libraries, but ~4m46s
-measured at 2,352 series. There is no re-entrancy guard: a run that outlasts its interval is aborted
-by the next one, which restarts from the beginning. Rows already written are kept, so nothing
-corrupts, but the *tail of the list is then never reached* and those titles silently stop resolving.
-Above ~2,000 series use 15 minutes. (The 1,000/2,000 figures are interpolated from two measurements,
-not measured across the range.) TMDB is not a constraint — lookups are cached 6-12h, so cadence and
-API volume are decoupled.
+change detection. Its pacing *floor* is `ceil(series / 50) × 4s` — one fixed 4s sleep per bundle of
+50 — but real runs land well above the floor, because per-series work adds to it. The two figures
+this rests on: 4.07s measured here at 1 series (which is just the single 4s sleep, so it says nothing
+about the slope), and a report of 2,352 series whose floor is 192s but which took **4m46s actual**,
+roughly 50% over floor. Above ~2,000 series use 15 minutes.
+
+**Both the ~1,000/~2,000 ceiling and the 50%-over-floor factor are interpolated from those two
+points. Nobody has measured anything in between.** The 2,352-series figure is a user report on the
+Seerr tracker ([#3307](https://github.com/seerr-team/seerr/issues/3307) discussion), not a
+measurement taken on this stack — if the ceiling ever matters to you, re-time it rather than trusting
+this line.
+
+There is no re-entrancy guard: a run that outlasts its interval is aborted by the next one, which
+restarts from the beginning. Rows already written are kept, so nothing corrupts, but the *tail of the
+list is then never reached* and those titles silently stop resolving — a failure that looks like
+success, because the front of the library keeps working. TMDB is not a constraint: lookups are cached
+6-12h, so cadence and API volume are decoupled.
 
 ## Things to Know
 
