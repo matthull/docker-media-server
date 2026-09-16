@@ -67,7 +67,10 @@ sys.stdout.write("\n404")
 STUB_SLEEP = "#!/bin/sh\nexit 0\n"
 
 
-def series_item(item_id="ITEM1", name="Chewing Gum", tvdb="301562", path="/home/matt/media/complete/tv/Chewing Gum"):
+# Fixture titles, ids and paths are made up. This repo is public: never use a real host's paths or
+# library contents here. The Jellyfin path is a host path and the Sonarr one a container path, so
+# they share only the series folder name -- which is all the script compares.
+def series_item(item_id="ITEM1", name="Example Show", tvdb="100001", path="/srv/media/complete/tv/Example Show"):
     return {"Id": item_id, "Name": name, "Path": path,
             "ProviderIds": ({"Tvdb": tvdb} if tvdb else {})}
 
@@ -131,8 +134,8 @@ class RefreshScriptTest(unittest.TestCase):
 
     def import_env(self, **over):
         base = {"sonarr_eventtype": "Download", "sonarr_series_id": "5",
-                "sonarr_series_title": "Chewing Gum", "sonarr_series_tvdbid": "301562",
-                "sonarr_series_path": "/data/complete/tv/Chewing Gum"}
+                "sonarr_series_title": "Example Show", "sonarr_series_tvdbid": "100001",
+                "sonarr_series_path": "/data/complete/tv/Example Show"}
         base.update(over)
         return base
 
@@ -272,8 +275,8 @@ class RefreshScriptTest(unittest.TestCase):
     def test_ignores_a_different_series(self):
         plan = [
             {"match": "/Items?IncludeItemTypes=Series",
-             "body": {"Items": [series_item(item_id="OTHER", name="Fleabag", tvdb="314614",
-                                            path="/home/matt/media/complete/tv/Fleabag")]}},
+             "body": {"Items": [series_item(item_id="OTHER", name="Another Show", tvdb="100002",
+                                            path="/srv/media/complete/tv/Another Show")]}},
         ]
         r = self.run_script(plan, env=self.import_env())
         self.assertEqual(r.returncode, 1)
