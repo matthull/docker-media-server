@@ -27,6 +27,12 @@ services:
       # a perfectly reasonable .env silently break the connector.
       - JELLYFIN_URL=${JELLYFIN_INTERNAL_URL:-http://host.docker.internal:8096}
       - JELLYFIN_API_KEY=${JELLYFIN_ARR_API_KEY:-}
+    # Jellyfin runs on the host, not in this stack, and Docker Engine on Linux does not define
+    # host.docker.internal on its own. This makes the default above resolve to the host. Under
+    # Docker Engine inside WSL it resolves to the WSL distro, not Windows -- set
+    # JELLYFIN_INTERNAL_URL instead. See docs/jellyfin-library-updates.md.
+    extra_hosts:
+      - host.docker.internal:host-gateway
     ports:
       - 8989:8989
     networks:
@@ -53,6 +59,9 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+    # For the "Jellyfin library update" connector; see the note on sonarr.
+    extra_hosts:
+      - host.docker.internal:host-gateway
     ports:
       - 7878:7878
     networks:
@@ -94,6 +103,9 @@ services:
     init: true
     environment:
       - TZ=${TZ}
+    # So Seerr can reach a Jellyfin on the host; see the note on sonarr.
+    extra_hosts:
+      - host.docker.internal:host-gateway
     networks:
       - sofa-squad
     volumes:

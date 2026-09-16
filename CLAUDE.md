@@ -194,6 +194,16 @@ exists but Parasite is still grabbable. Dual-audio dubs are blocked separately b
 muxes lie: one NORDiC release flagged all six audio tracks `default=1`, resolving to the first
 (Danish); a `German.DL` release had German as stream 1 with `default=1`.
 
+**An empty Jellyfin library folder silently swallows the first import.** Jellyfin 10.11 never
+watches an empty library folder, drops its root `Folder` item on any scan, and then answers the arr
+connector's `POST /Library/Media/Updated` with a 204 and does nothing. It also never removes the
+last deleted item. The fix is an ignored `.keep-library-nonempty` file in each library root, plus the
+Emby / Jellyfin connector with **Map Paths** set. The connector's Test button returns 200 with a
+wrong API key. Do not delete the placeholders. See
+[docs/jellyfin-library-updates.md](./docs/jellyfin-library-updates.md). `extra_hosts: host-gateway`
+on sonarr/radarr/seerr in `docker-compose.yml` is what makes `host.docker.internal` resolve on Linux.
+It does nothing when Jellyfin runs somewhere else.
+
 **`_UNPACK_` / `_FAILED_` prefixes match `downloadClientWorkingFolders`**, so Radarr refuses to import
 from those folders — "File is still being unpacked". Rename the folder, then
 `GET /manualimport?folder=…` and `POST /command {name:ManualImport}`. Wanted films can sit there for

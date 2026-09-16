@@ -89,7 +89,8 @@ is the case where it does not — check which you have.
 **Reserve `<HOST_LAN_IP>` in your router's DHCP settings.** A lease that moves turns into 502s from a
 tunnel that still reports Healthy, and nothing here will tell you why.
 
-None of this applies on Linux hosts: use the host's LAN IP, or `network_mode: host`.
+None of this applies on Linux hosts: use the host's LAN IP, or `network_mode: host`. (`cloudflared`
+has no `host-gateway` entry, unlike sonarr, radarr and seerr.)
 
 ## Routing other services
 

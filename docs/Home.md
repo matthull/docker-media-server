@@ -17,6 +17,7 @@ Setup guides for each service in the stack. See the [README](https://github.com/
 
 - [Tailscale / Remote Access](Tailscale) — VPN setup for accessing services from anywhere
 - [Cloudflare Tunnel](Cloudflared) — public access without port forwarding
+- [Jellyfin Library Updates](Jellyfin-Library-Updates) — getting imports into Jellyfin, and why the first one silently doesn't
 - [Jellyfin Plugins](Jellyfin-Plugins) — what's worth installing, and what breaks the server
 - [Notifications](Notifications) — ntfy alerting across the stack, and what not to send
 - [Stack Watch](Stack-Watch) — alerts for dead containers, an offline host and requests that never download

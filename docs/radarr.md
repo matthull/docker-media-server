@@ -11,6 +11,9 @@ Sonarr for movies — monitors wanted films, grabs them, organizes the library.
    `docker-compose.override.yml`, otherwise `/movies`.
 3. **Indexers** — sync automatically from Prowlarr.
 4. **Quality Profiles** — let Recyclarr sync TRaSH profiles.
+5. **Tell Jellyfin about imports** — library placeholders plus the Emby / Jellyfin connector,
+   *before* the first import. See [Jellyfin Library Updates](Jellyfin-Library-Updates); without it
+   the first movie can stay invisible in Jellyfin.
 
 ## Things to Know
 

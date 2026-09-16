@@ -11,6 +11,7 @@
 **Guides**
 - [Tailscale / Remote Access](Tailscale)
 - [Cloudflare Tunnel](Cloudflared)
+- [Jellyfin Library Updates](Jellyfin-Library-Updates)
 - [Jellyfin Plugins](Jellyfin-Plugins)
 - [Notifications](Notifications)
 - [Stack Watch](Stack-Watch)

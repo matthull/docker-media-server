@@ -11,6 +11,9 @@ TV management. Monitors for episodes, sends NZBs to SABnzbd, organizes the resul
    `docker-compose.override.yml`, otherwise `/tv`.
 3. **Indexers** — sync automatically from Prowlarr; otherwise add them under Settings > Indexers.
 4. **Quality Profiles** — let Recyclarr sync TRaSH profiles rather than hand-tuning.
+5. **Tell Jellyfin about imports** — library placeholders plus the Emby / Jellyfin connector,
+   *before* the first import. See [Jellyfin Library Updates](Jellyfin-Library-Updates); without it
+   the first series can stay invisible in Jellyfin.
 
 ## Things to Know
 

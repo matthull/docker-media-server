@@ -49,7 +49,9 @@ like separate filesystems to the container, so `link()` fails and every import s
 full copy. Its header explains the layout.
 
 Then configure each service through its web UI — see the
-[wiki](https://github.com/bcanfield/docker-media-server/wiki).
+[wiki](https://github.com/bcanfield/docker-media-server/wiki). Before the first import, set up
+[Jellyfin Library Updates](https://github.com/bcanfield/docker-media-server/wiki/Jellyfin-Library-Updates):
+Jellyfin never notices a title imported into an empty library folder, and nothing reports it.
 
 ## Back Up Your Config
 
