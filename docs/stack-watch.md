@@ -76,9 +76,12 @@ new account.
   It says "still not resolved" and not "unchanged" on purpose — the report ratchets to the low point
   of the episode, so someone who has just freed 60G and is still under `DISK_FREE_MIN` sees the same
   sentence as before, and should not also be told that nothing has changed.
-- **The all clear names what recovered.** Because the disk report ratchets, freeing 60G to go from
-  10G to 70G free changes nothing until `DISK_FREE_MIN` itself is cleared, so the all clear is the
-  only acknowledgement a recovery gets and it has to say what it is acknowledging.
+- **The all clear names what recovered** — but only when *everything* tracked clears at once. If some
+  problems recover while others remain, the notification silently drops the recovered ones from the
+  list with no acknowledgement at all; only a full all clear currently says what cleared. Because the
+  disk report ratchets, freeing 60G to go from 10G to 70G free changes nothing until `DISK_FREE_MIN`
+  itself is cleared, so for the disk specifically the all clear is the only acknowledgement a recovery
+  gets and it has to say what it is acknowledging.
 - **The wanted-titles digest** lists monitored movies and episodes with no file and nothing in the
   download queue, `STALL_DAYS` after they were added or released, whichever is later. New titles come
   first. Each title gets a reminder every `STALL_REMIND_DAYS`, at most twice.
@@ -314,3 +317,14 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   otherwise. Worth knowing when `MEDIA_ROOT` moves onto its own drive.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
+- **A partial recovery, when other problems remain.** The all clear names what recovered, but only
+  when *every* tracked problem clears in the same run. If one problem recovers while another is still
+  active, the "N problems" notification silently drops the recovered one from its list with no
+  acknowledgement — confirmed live, not just in a unit test. Fix inscribed: opus
+  `close-four-remaining-disk-alert-gaps-in`.
+- **An inferred fallback path vanishing while it was a real, alerted disk problem.** `SABNZBD_TEMP`
+  left blank watches Compose's fallback; if that path later becomes unreadable (removed, unmounted),
+  the check reads it the same as "not configured" and stops watching it silently. An already-alerted
+  problem on that filesystem then decays through absence and is reported as a genuine all clear
+  ("Cleared: …") even though free space was never actually confirmed to have recovered — only that the
+  path stopped answering. Confirmed live. Fix inscribed: opus `close-four-remaining-disk-alert-gaps-in`.
