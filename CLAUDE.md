@@ -232,6 +232,29 @@ rejected — even ones scoring 2275.
   reverts it on the next sync anyway, and it would disable size validation for every series to work
   around one.
 
+**Seerr's recently-added scan is a permanent no-op for TV libraries.** `getRecentlyAdded()` calls
+`GET /Items/Latest`, which on Jellyfin 10.11 returns items of type **`Episode`** for a show library
+(true with `GroupItems` true, false, or unset). Seerr's `processItem()` dispatches on **`Movie` or
+`Series` only** and drops anything else with no log line and no error. So the 5-minute scan can never
+mark a TV request available; only the daily `jellyfin-full-scan` can, because `getLibraryContents()`
+asks for `IncludeItemTypes=Series,Movie,Others`. Movies are unaffected, which makes this look like "TV
+is just slow" rather than a defect. Log signature: `Beginning to process recently added for library:
+<TV lib>` followed immediately by `Recently Added Scan Complete` with **no per-title line**, while the
+movie library logs one every cycle. Verified against Jellyseerr 3.4.1 / Jellyfin 10.11.11.
+
+**A connector-driven Jellyfin refresh creates the items but not the series hierarchy.** After a
+`POST /Library/Media/Updated` (what the arrs' Emby/Jellyfin connector sends) the Series, Season and
+Episode items exist and are listable via `/Items?ParentId=<library>&Recursive=true` — but
+`GET /Shows/{seriesId}/Seasons` and `GET /Shows/{seriesId}/Episodes` both return
+`TotalRecordCount: 0`, with or without `userId`. Those two endpoints are exactly what Seerr counts
+episodes with, so its full scan computes **zero** available episodes and **regresses** the media record
+from status 3 (processing) to status 1 (unknown) — worse than not scanning. A full library scan
+(`POST /Library/Refresh`) populates them within ~60 s, after which a Seerr rescan resolves the request
+immediately. Consequence: on a first TV import, Jellyfin needs a full scan *before* Seerr scans, and
+the scheduled 12 h Jellyfin scan vs Seerr's nightly full scan gives no ordering guarantee. When
+debugging "the episode is in Jellyfin but Seerr says Processing", check the `/Shows/...` endpoints —
+`/Items` will happily tell you everything is fine.
+
 **SABnzbd's temp-folder free space turning red does not mean the disk is low.** `glitter.main.js`
 colours it whenever the remaining queue exceeds free temp space (`mbleft/1024 > diskspace1`), which is
 normal during a backfill and self-clears. `download_free = 50G` + `fulldisk_autoresume = 1` are the
