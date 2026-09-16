@@ -75,6 +75,39 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("J2", '        print(f"jellyfin health check failed: {exc}", file=sys.stderr)\n',
      "",
      "drops the real reason entirely, so the journal can't say why Jellyfin was unreachable"),
+    # --- Seerr's download-tracker patch, which its own healthcheck cannot see
+    ("SP1", '    if "refreshMonitoredDownloads" in source:', "    if False:",
+     "an unpatched Seerr is reported as patched"),
+    ("SP2", '    if "getQueue" not in source:', "    if False:",
+     "an empty or unrelated file passes for a patched tracker, because the patch is an absence"),
+    ("SP3", '        return "seerr: can\'t check its download-tracker patch (details in the journal)"',
+     '        return f"seerr: can\'t check its download-tracker patch ({brief(exc)})"',
+     "leaks docker's error text to the public topic"),
+    ("SP4", '        print(f"seerr patch check failed: {exc}", file=sys.stderr)\n', "",
+     "drops the real reason, so the journal can't say why the check failed"),
+    ("SP5", "    except COMMAND_ERRORS as exc:\n        print(f\"seerr patch check failed",
+     "    except RuntimeError as exc:\n        print(f\"seerr patch check failed",
+     "a hung exec times out through the whole run instead of being one problem"),
+    ("SP6", "], timeout=SEERR_EXEC_TIMEOUT)", "])",
+     "the read waits run_cmd's 60s, pushing a worst-case run past TimeoutStartSec"),
+    ("SP7", "SEERR_EXEC_TIMEOUT = 5", "SEERR_EXEC_TIMEOUT = 60",
+     "the same, by retuning the constant"),
+    ("SP8", 'if SEERR_CONTAINER in config["services"] and f"service:{SEERR_CONTAINER}" not in problems:',
+     'if f"service:{SEERR_CONTAINER}" not in problems:',
+     "a stack without Seerr reports 'can't check' on every run"),
+    ("SP9", 'if SEERR_CONTAINER in config["services"] and f"service:{SEERR_CONTAINER}" not in problems:',
+     'if SEERR_CONTAINER in config["services"]:',
+     "a stopped Seerr is reported twice, once as stopped and once as unreadable"),
+    ("SP10", "        if problem:\n            problems[SEERR_PATCH] = problem", "        if False:\n            pass",
+     "the patch check runs but its result is thrown away"),
+    ("SP11", 'if k.startswith("service:") or k == SEERR_PATCH}', 'if k.startswith("service:")}',
+     "Docker going down announces the patch as Cleared, unchecked, then re-alerts"),
+    ("SP12", '        elif f"service:{SEERR_CONTAINER}" in problems and SEERR_PATCH in previous:',
+     "        elif False:",
+     "stopping Seerr announces the patch as Cleared, unchecked"),
+    ("SP13", 'SEERR_TRACKER = "/app/dist/lib/downloadtracker.js"',
+     'SEERR_TRACKER = "/app/dist/lib/downloadTracker.js"',
+     "the check reads a path the build never edits"),
     # --- the ratchet, which is what keeps a wobbling drive from spending the day's alerts
     ("R1", "level = min([int(minimum * step)] + kept)", "level = max([int(minimum * step)] + kept)",
      "the ratchet runs backwards: the report only ever rises"),
@@ -332,6 +365,10 @@ def main() -> int:
         # The suite asserts against files outside monitoring/ too — DISK_ROLES' fallback has to stay
         # the one Compose applies — so they have to exist in the throwaway tree as well.
         shutil.copy(REPO / "docker-compose.yml", tree / "docker-compose.yml")
+        # Likewise the Seerr check's path has to stay the one the image build patches.
+        (tree / "images" / "seerr").mkdir(parents=True)
+        shutil.copy(REPO / "images" / "seerr" / "patch-downloadtracker.sh",
+                    tree / "images" / "seerr" / "patch-downloadtracker.sh")
         if not suite_passes(tree):
             print("The suite is already failing; fix that before reading anything into mutants.")
             return 1

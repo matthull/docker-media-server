@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stack watch: the alerts this stack's services cannot send about themselves.
 
-  check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Jellyfin
-           stops answering, the drive the library and downloads live on is running out of room,
-           or Docker itself is down. Also keeps an ntfy dead man's switch scheduled that fires if
+  check    Every CHECK_INTERVAL. Alerts when a Compose service is stopped or unhealthy, Seerr is
+           running without its download-tracker patch, Jellyfin stops answering, the drive the
+           library and downloads live on is running out of room, or Docker itself is down. Also keeps an ntfy dead man's switch scheduled that fires if
            this host stops checking in (asleep, powered off, offline).
   stalled  Daily. Alerts on monitored items Sonarr/Radarr still have no file for after
            STALL_DAYS. Nothing else reports this: a request can be accepted and then wait
@@ -119,7 +119,7 @@ DISK_FREE_MIN_DEFAULT = "100G"
 DISK_STEPS = (1, 0.5, 0.25, 0.1)
 
 Http = Callable[..., str]
-Run = Callable[[list], str]
+Run = Callable[..., str]  # (argv, timeout=...) -> stdout; see run_cmd
 
 
 @dataclass(frozen=True)
@@ -578,6 +578,15 @@ def run_stalled(watch: Watch, state: dict) -> None:
 COMMAND_ERRORS = (RuntimeError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError)
 BLINDING_PROBLEMS = {"docker", "compose"}  # while either is up, services' states are unknown
 
+# Seerr is built, not pulled, so that its download tracker stops issuing an arr write that freezes the
+# progress bar (images/seerr/README.md). Its healthcheck passes identically without that patch, so the
+# patch is asserted by reading the file the build edits. The service, and its container_name.
+SEERR_CONTAINER = "seerr"
+SEERR_TRACKER = "/app/dist/lib/downloadtracker.js"  # patch-downloadtracker.sh's target
+SEERR_PATCH = "seerr:patch"
+# The read takes ~0.2s. run_cmd's 60 would push a worst-case run past the unit's TimeoutStartSec.
+SEERR_EXEC_TIMEOUT = 5
+
 
 def stack_problems(stack_dir: Path, run: Run) -> dict[str, str]:
     try:
@@ -593,7 +602,34 @@ def stack_problems(stack_dir: Path, run: Run) -> dict[str, str]:
     except COMMAND_ERRORS as exc:
         print(f"docker failed: {exc}", file=sys.stderr)
         return {"docker": "docker: not responding (details in the journal)"}
-    return container_problems(sorted(config["services"]), containers)
+    problems = container_problems(sorted(config["services"]), containers)
+    # A Seerr that isn't running can't be read, and is already the problem being reported.
+    if SEERR_CONTAINER in config["services"] and f"service:{SEERR_CONTAINER}" not in problems:
+        problem = seerr_patch_problem(run)
+        if problem:
+            problems[SEERR_PATCH] = problem
+    return problems
+
+
+def seerr_patch_problem(run: Run) -> str | None:
+    """Whether the running Seerr still lacks the refreshMonitoredDownloads call its build deletes.
+
+    The file is read whole and searched here rather than with `grep -c`, which exits 1 precisely when
+    the count is the 0 that means patched — indistinguishable, through run_cmd, from a failed exec.
+    The patch is an absence, so the getQueue calls it leaves in place are what show this is the
+    tracker at all and not an empty or unrelated file."""
+    try:
+        source = run(["docker", "exec", SEERR_CONTAINER, "cat", SEERR_TRACKER], timeout=SEERR_EXEC_TIMEOUT)
+    except COMMAND_ERRORS as exc:
+        print(f"seerr patch check failed: {exc}", file=sys.stderr)
+        return "seerr: can't check its download-tracker patch (details in the journal)"
+    if "getQueue" not in source:
+        print(f"seerr patch check: {SEERR_TRACKER} has no getQueue call ({len(source)} characters read)",
+              file=sys.stderr)
+        return "seerr: can't recognise its download tracker, so the patch is unchecked"
+    if "refreshMonitoredDownloads" in source:
+        return "seerr: running without its download-tracker patch (see images/seerr/README.md)"
+    return None
 
 
 def container_problems(services: list[str], containers: list[dict]) -> dict[str, str]:
@@ -1069,7 +1105,10 @@ def run_check(watch: Watch, state: dict) -> None:
         if problems.keys() & BLINDING_PROBLEMS:
             # Docker can't say how the services are, so keep what it last said rather than read its
             # silence as recovery.
-            tracked |= {k: v for k, v in previous.items() if k.startswith("service:")}
+            tracked |= {k: v for k, v in previous.items() if k.startswith("service:") or k == SEERR_PATCH}
+        elif f"service:{SEERR_CONTAINER}" in problems and SEERR_PATCH in previous:
+            # Nor is a stopped Seerr evidence that it has been rebuilt.
+            tracked[SEERR_PATCH] = previous[SEERR_PATCH]
         # State from before the stack record: treat what was alerted then as already shown. Dated
         # now, because when it actually went out is unknowable here and STACK_REPEAT would otherwise
         # re-send every old alert on the first run after an upgrade — but only when there is
