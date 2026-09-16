@@ -16,7 +16,7 @@ serving a disproportionate amount of non-HTML content — video specifically —
 Personal use is common and usually uneventful; sustained streaming for a large group is the pattern
 that draws enforcement.
 
-[Tailscale](Tailscale) is already in this stack and is the ToS-clean option for your own devices. Use
+[Tailscale](tailscale.md) is already in this stack and is the ToS-clean option for your own devices. Use
 the tunnel when you need to hand someone a URL that works without installing anything.
 
 You need a domain on Cloudflare nameservers and a
@@ -109,7 +109,7 @@ docker run --rm --network sofa-squad curlimages/curl \
   -s -o /dev/null -w '%{http_code}\n' http://seerr:5055/api/v1/status
 ```
 
-Seerr also needs *Enable Proxy Support* and *Application URL* set — see [Seerr](Seerr).
+Seerr also needs *Enable Proxy Support* and *Application URL* set — see [Seerr](seerr.md).
 
 ## Cloudflare Access (optional)
 

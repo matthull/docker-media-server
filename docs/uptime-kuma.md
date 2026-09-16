@@ -11,7 +11,7 @@ Open the UI and create the admin account — there is no default login, and the 
 unauthenticated until you do, so do it before exposing the port anywhere.
 
 Its SQLite database lives in `${CONFIG_ROOT}/config/uptime-kuma`, so the existing
-[backup](Backups) scripts already cover it.
+[backup](backups.md) scripts already cover it.
 
 ## Monitors
 
@@ -35,7 +35,7 @@ Sonarr and Radarr need `/sonarr` and `/radarr` prefixes, Prowlarr and Bazarr do 
 `http://sonarr:8989/ping` returns the SPA with a **200** and would pass forever.
 
 Services in this stack are reachable by container name because Uptime Kuma shares the `sofa-squad`
-network. Jellyfin needs its host's LAN address — see [Cloudflare Tunnel](Cloudflared) for why
+network. Jellyfin needs its host's LAN address — see [Cloudflare Tunnel](cloudflared.md) for why
 `host.docker.internal` is wrong under WSL.
 
 **Set retries to 2-3.** These containers restart on image updates; a single failed check with no
@@ -57,14 +57,14 @@ trade.
 
 Recyclarr in particular cannot be usefully monitored this way regardless — its failure mode is
 running successfully while syncing nothing. See the duplicate-instance trap in
-[Recyclarr](Recyclarr).
+[Recyclarr](recyclarr.md).
 
 ## Notifications
 
 Configure one before relying on any of this — a monitor with no notification is a dashboard you will
 not be looking at when it matters, and ~1-minute detection is the main thing Kuma offers over
 checking by hand. Settings > Notifications, and tick *Apply on all existing monitors* plus *Default
-enabled* so new monitors inherit it. See [Notifications](Notifications) for the channel this stack
+enabled* so new monitors inherit it. See [Notifications](notifications.md) for the channel this stack
 uses and why.
 
 ## Expiry, not just availability

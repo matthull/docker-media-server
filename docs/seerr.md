@@ -9,7 +9,7 @@ Request portal. People browse and request here; Seerr routes to Radarr/Sonarr.
 1. **Connect Jellyfin** — server URL and an API key from Jellyfin > Dashboard > API Keys. This is how
    Seerr knows what you already have. For a Jellyfin on the same Linux host the address is
    `host.docker.internal`, port `8096`; otherwise see
-   [Reaching a Jellyfin that is not in this stack](Jellyfin-Library-Updates#reaching-a-jellyfin-that-is-not-in-this-stack).
+   [Reaching a Jellyfin that is not in this stack](jellyfin-library-updates.md#reaching-a-jellyfin-that-is-not-in-this-stack).
 2. **Connect Radarr** — host `radarr`, port `7878`, API key. Pick a default quality profile and root
    folder.
 3. **Connect Sonarr** — host `sonarr`, port `8989`, same idea.

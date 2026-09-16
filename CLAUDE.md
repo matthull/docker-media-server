@@ -66,6 +66,25 @@ There is no `extras/`. Every service in the repo is one this stack actually runs
 documented here is verified against a live install rather than shipped on spec. Optional containers
 hang off Compose profiles in the core file (`cloudflared` is the pattern), not a second stack.
 
+### Docs are read from the repo, not the wiki
+
+`docs/` is the only place the guides are published. Link to them as files — `docs/sonarr.md` from
+the README, `sonarr.md#anchor` between guides — never as a wiki URL or a bare wiki page name
+(`(Sonarr)`). Bare names only resolve inside a GitHub wiki, and this fork has none. The upstream
+`bcanfield/docker-media-server` wiki lacks every fork-only page (Jellyfin Library Updates, Stack
+Watch) and its other pages describe upstream's stack.
+
+`.github/workflows/wiki.yml` is inherited and **has never run here** — no workflow on this fork has
+ever run. Its action rewrites `x.md` links to `x` on publish, so file links stay correct if a wiki
+is ever turned on. **Do not switch on Actions for the fork without dealing with `tag.yml` first.**
+That workflow runs on every push to `main`. It rewrites `version.txt` and `changelog.md`, commits
+them as upstream's maintainer, then pushes to `main` and tags. It declares no `permissions:`,
+and this fork's default token is read-only. So as configured, it would fail on every push. Give
+the token write access and it would succeed instead: every push would put someone else's name
+on a commit, and every local push after it would be rejected as behind. Publishing the wiki would
+also need its first page created in the web UI, which the action requires whatever its strategy.
+The Wiki tab is still enabled, so a visitor who opens it finds only an empty wiki.
+
 ### Local, untracked files
 
 | Path                          | What it holds                                            |

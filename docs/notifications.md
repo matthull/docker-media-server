@@ -38,7 +38,7 @@ application updates.
 
 **Manual interaction required** is worth keeping on the alert channel: it fires when an import needs
 a human, which is how a wanted film sits in an `_UNPACK_` folder for weeks looking like residue. See
-[Radarr](Radarr).
+[Radarr](radarr.md).
 
 **SABnzbd routes per event.** Its default `apprise_urls` points at ntfy while
 `apprise_target_complete` overrides just completions to Discord — so the split needs no second
@@ -109,7 +109,7 @@ print(a.notify(title='Test', body='Hello'))\""
 
 Every connector above is a service reporting on itself. None of them can say that its own container
 stopped, that the host went to sleep, or that a request was accepted and then never found a release.
-[Stack watch](Stack-Watch) covers those, on the same ntfy topic.
+[Stack watch](stack-watch.md) covers those, on the same ntfy topic.
 
 ## If you outgrow ntfy.sh
 

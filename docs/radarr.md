@@ -12,12 +12,12 @@ Sonarr for movies — monitors wanted films, grabs them, organizes the library.
 3. **Indexers** — sync automatically from Prowlarr.
 4. **Quality Profiles** — let Recyclarr sync TRaSH profiles.
 5. **Tell Jellyfin about imports** — library placeholders plus the Emby / Jellyfin connector,
-   *before* the first import. See [Jellyfin Library Updates](Jellyfin-Library-Updates); without it
+   *before* the first import. See [Jellyfin Library Updates](jellyfin-library-updates.md); without it
    the first movie can stay invisible in Jellyfin.
 
 ## Things to Know
 
-- **Same hardlink rules as Sonarr** — see [Sonarr](Sonarr). Don't use exFAT; it has no hardlinks.
+- **Same hardlink rules as Sonarr** — see [Sonarr](sonarr.md). Don't use exFAT; it has no hardlinks.
 - **Naming** — TRaSH recommends `{Movie CleanTitle} ({Release Year}) {imdb-{ImdbId}}`.
 - **API key** — Settings > General > Security. Needed by Seerr and Bazarr.
 - **Collections hold profile references too.** Radarr refuses to delete a quality profile that no

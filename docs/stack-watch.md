@@ -1,6 +1,6 @@
 # Stack Watch
 
-The services' own [notifications](Notifications) cover what each one can see about itself: a failed
+The services' own [notifications](notifications.md) cover what each one can see about itself: a failed
 download, an indexer health error, a request Seerr couldn't hand off. Some failures can't report
 themselves:
 
@@ -167,7 +167,7 @@ checks.
 
 ## Setup
 
-1. Set up the ntfy topic first ([Notifications](Notifications), step 1), and subscribe to it on your phone.
+1. Set up the ntfy topic first ([Notifications](notifications.md), step 1), and subscribe to it on your phone.
 2. Add the topic to `.env`. The rest is optional; `.env.example` documents each setting.
 
    | Variable | Default | Meaning |

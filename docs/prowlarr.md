@@ -9,7 +9,7 @@ Indexer manager. Add usenet indexers once here and they sync to Sonarr/Radarr au
 1. **Configure Sonarr/Radarr first** — they need root folders and download clients before Prowlarr
    can sync to them.
 2. **Add Indexers** — Indexers > Add (+). Enter credentials and test each. See
-   [Usenet Indexers](Usenet-Indexers).
+   [Usenet Indexers](usenet-indexers.md).
 3. **Connect Apps** — Settings > Apps > Add Application. Add Sonarr and Radarr with their URLs and
    API keys, sync level **Full Sync**.
 4. **Verify** — the indexers should appear in Sonarr/Radarr under Settings > Indexers.

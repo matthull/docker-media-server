@@ -5,7 +5,7 @@ and why. Written against Jellyfin 10.11 in 2026-08; re-check versions before tru
 
 The constraint behind every decision: **the primary client is the native Jellyfin app on a Fire Stick
 / Android TV** (`jellyfin-androidtv`). That rules out most of what appears in "best Jellyfin plugins"
-lists. Jellyfin runs outside this stack (see [cloudflared](Cloudflared) for addressing it from a
+lists. Jellyfin runs outside this stack (see [cloudflared](cloudflared.md) for addressing it from a
 container), and Bazarr owns subtitles.
 
 ## Two current landmines

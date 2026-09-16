@@ -88,7 +88,7 @@ watchers, and a watcher that hits an error is disposed and stays gone until the 
 
 Jellyfin > Dashboard > **API Keys** > +, named for what uses it (e.g. `sonarr-radarr-library-update`).
 It is shown once and cannot be read back, so put it in `.env` as `JELLYFIN_ARR_API_KEY`. Sonarr's
-[series-refresh connector](Sonarr#brand-new-series-arrive-in-jellyfin-with-nothing-to-play) reads it
+[series-refresh connector](sonarr.md#brand-new-series-arrive-in-jellyfin-with-nothing-to-play) reads it
 from there. A dedicated key can be revoked without
 breaking Seerr or anything else.
 
@@ -154,7 +154,7 @@ connectors use the same address.
 | Where Jellyfin runs | Use as Host |
 | --- | --- |
 | Natively on the same Linux host | `host.docker.internal` |
-| Natively on Windows, Docker Engine inside WSL | The Windows host's LAN IP. `host.docker.internal` is the WSL distro there, not Windows; see [Cloudflare Tunnel](Cloudflared#why-that-address) |
+| Natively on Windows, Docker Engine inside WSL | The Windows host's LAN IP. `host.docker.internal` is the WSL distro there, not Windows; see [Cloudflare Tunnel](cloudflared.md#why-that-address) |
 | In a container on the `sofa-squad` network | its container name |
 | On another machine | its LAN IP (reserve it in your router's DHCP settings) |
 
@@ -193,7 +193,7 @@ minute after that 204, check **Map Paths** first.
   scans, keep them away from imports.
 - **A brand-new series can arrive with no seasons or episodes to play.** That is a different
   Jellyfin bug, and it bites on season packs. Sonarr has a separate fix: see
-  [Sonarr](Sonarr#brand-new-series-arrive-in-jellyfin-with-nothing-to-play).
+  [Sonarr](sonarr.md#brand-new-series-arrive-in-jellyfin-with-nothing-to-play).
 - **A movie refresh may rescan the whole Movies library**
   ([jellyfin#16172](https://github.com/jellyfin/jellyfin/issues/16172)). This is harmless at small
   library sizes.
