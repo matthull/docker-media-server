@@ -131,19 +131,36 @@ with `BEGIN IMMEDIATE` and timing the POST:
 Response time tracks the lock hold almost exactly — so a bigger timeout really does convert these
 into successes, up to a point.
 
-**Use 45000, not 30000.** Sonarr (4.0.19) has a hard server-side ceiling: past ~30 s it gives up and
-returns **HTTP 500 at 30.07-30.10 s**, reproducible across three trials. Setting the timeout to
-30000 makes Seerr's client deadline race that ceiling by ~75 ms — Seerr aborts first and logs a
-*timeout*, hiding the real HTTP 500 behind what looks like a network fault. It also throws away the
-30-45 s band on Radarr, which has no such ceiling and returns 201 there. 45000 keeps every success
-30000 would get, adds Radarr's 30-45 s band, and lets Sonarr's 500 arrive as itself.
+**Use 45000, not 30000.** Under that synthetic single-holder conflict Sonarr (4.0.19) gives up and
+returns **HTTP 500 at 30.07-30.10 s**, reproducible across three trials, so a 30000 client deadline
+races it by ~75 ms — Seerr aborts first and logs a *timeout*, hiding a real HTTP 500 behind what
+looks like a network fault. It also throws away the 30-45 s band on Radarr, which has no such ceiling.
+45000 keeps every success 30000 would get and adds Radarr's band.
 
-**Residual — this does not fix everything, and cannot.** Sonarr's 30 s ceiling is Sonarr's, and no
-Seerr-side setting reaches it: contention longer than ~30 s still fails. Under *real* multi-writer
-contention an arr can also exhaust its Polly retries and 500 much sooner (one observed at 11 s after
-the cycle start). A longer timeout is useless against a 500. Verified both directions: three
-consecutive cycles under a deliberate 20 s lock conflict stayed clean, while a 50 s conflict still
-failed — Sonarr at 30.13 s (its ceiling) and Radarr at 45.02 s (Seerr's timeout).
+**Do not read that 30 s figure as a law of Sonarr.** It is the behaviour under one externally-held
+lock. Under real contention Sonarr has been seen returning **201 at 31.36 s**, past the "ceiling" —
+the deadline is evidently per-attempt, not per-request, and real multi-writer retry dynamics differ.
+Conversely an arr can exhaust its retries and 500 far *sooner* (one observed at 11 s after cycle
+start), and no timeout helps against a 500.
+
+**45000 is not sufficient under real download load, and this is the important measurement.** Ten
+tracker cycles sampled while a season pack was actively downloading (6 items in Sonarr's queue, RSS
+sync running):
+
+| | `POST /command` max | over 10 s | over 30 s | `GET /queue` max |
+| --- | --- | --- | --- | --- |
+| Radarr | **66.35 s** | 4/10 | 2/10 | **0.009 s** |
+| Sonarr | **31.36 s** | 3/10 | 1/10 | **0.008 s** |
+
+Three consecutive live cycles failed at exactly 45.01 s — Seerr's new timeout — during that download.
+So raising the timeout converts the common 10-30 s stalls into successes and still loses the tail,
+and it loses it *precisely when a requester is most likely to be watching*, because the contention is
+caused by the download they are waiting on.
+
+**The real conclusion: `GET /queue` never blocks.** Across every measurement above — synthetic lock
+held, real season pack downloading, both arrs — the read never exceeded **9 ms**. Only the write
+Seerr does not need is ever slow. No timeout value is the right answer to this; not issuing the write
+is. Treat 45000 as a palliative that covers the common case, not as a fix.
 
 The upstream fix — stop issuing the write, poll for command completion with a deadline, and share one
 in-flight promise across concurrent syncs — is [PR #3473](https://github.com/seerr-team/seerr/pull/3473),

@@ -210,18 +210,21 @@ in both projects and unaffected by Jellyfin version — do not go looking for an
 reasoning, the brand-new-series hierarchy bug it also sidesteps, and the library-size ceiling are in
 [docs/seerr.md](./docs/seerr.md).
 
-**Seerr's `apiRequestTimeout` must be 45000, and 30000 is the one wrong answer.** The Download
+**Seerr's `apiRequestTimeout` is 45000 here, and it is a palliative, not a fix.** The Download
 Tracker POSTs `RefreshMonitoredDownloads` — a database *write* — to both arrs every minute before
 reading the queue, so it blocks whenever an arr's own work holds the SQLite write lock, and the
-requester sees no download progress. Response time tracks the lock hold almost exactly, so a larger
-timeout genuinely converts these into successes — but **Sonarr 4.0.19 gives up at a hard ceiling and
-returns HTTP 500 at 30.07-30.10s** (three trials), so a 30000 client deadline races that ceiling by
-~75ms: Seerr aborts first and logs a *timeout*, disguising a real 500 as a network fault, and throws
-away the 30-45s band on Radarr, which has no ceiling. Both arrs are already `journal_mode=wal` — not
-tunable that way — and `GET /queue` measures 3-5ms *while the write lock is held*, so only the write
-is affected. Contention past ~30s still fails and no Seerr-side setting can reach it. Measurements,
-the residual, and why patching `downloadtracker.js` in the container is a trap are in
-[docs/seerr.md](./docs/seerr.md).
+requester sees no download progress. 45000 rather than 30000 because Sonarr 4.0.19 returns HTTP 500
+at 30.07-30.10s under a held lock, which a 30000 client deadline races by ~75ms (Seerr aborts first
+and logs a *timeout*, disguising the 500 as a network fault) and because Radarr has no such ceiling.
+**But 45000 does not hold under real load:** sampled during an active season-pack download,
+`POST /command` reached **66.35s** on Radarr and **31.36s on Sonarr with a 201** — past the supposed
+ceiling, so treat that 30s figure as per-attempt behaviour under a synthetic lock, not a law. Three
+consecutive live cycles failed at exactly 45.01s during that download. **The finding that matters:
+`GET /queue` never exceeded 9ms in any test** — synthetic lock held, real download in flight, either
+arr. Only the write Seerr does not need ever blocks, so no timeout value is the right answer and the
+tail is lost exactly when a requester is watching. Both arrs are already `journal_mode=wal`, so
+that is not tunable either. Measurements and why patching `downloadtracker.js` in the container is
+itself a trap (image bumps wipe it silently) are in [docs/seerr.md](./docs/seerr.md).
 
 **Bazarr provider reality (1.6.0):** `podnapisi` was removed upstream and is silently dropped from
 `enabled_providers` on restart; `subsource` needs an API key and throttles with `ConfigurationError`
