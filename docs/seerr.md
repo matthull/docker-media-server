@@ -47,9 +47,12 @@ Two independent upstream bugs cause this, and neither has a fix to wait for:
    fire to heal the stale keys. Individual episode imports self-heal in 5–15 min because later
    connector fires trigger series refreshes that update the children's keys. Sonarr prefers season
    packs when available, so the stranding case is the common one — worst-case resolution ≈36 h
-   (Jellyfin's 12 h scan interleaved with Seerr's daily 03:00 cron). Cheapest known repair:
-   `POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh`
-   ([jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293)).
+   (Jellyfin's 12 h scan interleaved with Seerr's daily 03:00 cron). Repair:
+   `POST /Items/{seriesId}/Refresh?metadataRefreshMode=FullRefresh`. **Now automatic** — see
+   [docs/sonarr.md](./sonarr.md) and `scripts/install-jellyfin-refresh.sh`. Note there is no
+   `recursive` parameter on that endpoint despite what
+   [jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293) says; it is silently dropped,
+   and the `FullRefresh` cascade from the series is what actually repairs the children.
 
 The Sonarr Scan sidesteps both: it derives availability from Sonarr's own
 `statistics.episodeFileCount` and never consults Jellyfin. It also completes the request itself — the
@@ -72,12 +75,12 @@ Unknown, but the next Sonarr Scan restores it within 5 minutes.
 Available with no "Play on Jellyfin" link. This does **not** reliably close itself on the nightly
 `jellyfin-full-scan` for season-pack arrivals — in the same live test, **two consecutive full scans
 left the hierarchy broken and `jellyfinMediaId` unset.** Only the targeted per-item refresh,
-`POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh` (jellyfin#17293),
+`POST /Items/{seriesId}/Refresh?metadataRefreshMode=FullRefresh`,
 actually resolved it (confirmed within ~20s). Since Sonarr prefers season packs when available, this
 is the common case, not the rare one — the deep-link gap can persist indefinitely, not just "until
-nightly." Availability itself is unaffected; only the Play-on-Jellyfin deep link is at risk. A coder
-opus (`wire-jellyfin-recursive-refresh-on-new-series-import`) is in flight to wire the targeted
-refresh automatically on import; once it lands, reconcile this paragraph.
+nightly." Availability itself is unaffected; only the Play-on-Jellyfin deep link is at risk. That
+refresh is now fired automatically on import by the Sonarr Custom Script connector installed with
+`scripts/install-jellyfin-refresh.sh` — see [docs/sonarr.md](./sonarr.md).
 
 **This is a Seerr setting, not Compose config — it does not travel with this repo.** It lives in
 Seerr's own config volume, so moving the stack to another machine, or restoring from a backup that

@@ -24,6 +24,89 @@ TV management. Monitors for episodes, sends NZBs to SABnzbd, organizes the resul
   existing series: `PUT /series/editor {seriesIds, rootFolderPath, moveFiles:true}`.
 - **Remote path mapping** is unnecessary here — Sonarr and SABnzbd see identical paths.
 
+## Brand-new series arrive in Jellyfin with nothing to play
+
+A series Jellyfin has never seen before lands with its poster and its overview and **no seasons
+and no episodes** — `GET /Shows/{id}/Seasons` and `/Shows/{id}/Episodes` both return 0 while a
+flat `GET /Items?Recursive=true` happily lists the episodes with the right `SeriesId`. Every
+client renders the series page from those two endpoints, so the show looks present and is
+unplayable. Seerr counts episodes with them too, so the request also stays "Processing".
+
+The cause is [jellyfin#16097](https://github.com/jellyfin/jellyfin/issues/16097): the join runs on
+`SeriesPresentationUniqueKey`, which is rewritten on the series once provider identification
+finishes but left stale on any child created before that moment.
+
+**Season packs are the case that does not recover.** Every new series strands briefly. Episodes
+that arrive in several batches heal themselves within 5–15 minutes, because each import fires the
+Jellyfin connector again and each fire rewrites the children's keys. A season pack imports every
+episode in one batch, so no second fire ever comes. Sonarr prefers season packs, which makes the
+unrecoverable case the common one — about 36 hours, until a full library scan happens to fix it.
+
+**A full library scan is not a reliable repair** — measured here, a stranded series survived two
+consecutive Jellyfin full scans untouched. A metadata `FullRefresh` on the series item fixed the
+same series in about 20 seconds.
+
+### The fix
+
+```bash
+./scripts/install-jellyfin-refresh.sh            # install or update
+./scripts/install-jellyfin-refresh.sh --check    # has the deployed copy drifted?
+./scripts/install-jellyfin-refresh.sh --uninstall
+```
+
+This copies `scripts/jellyfin-refresh-series.sh` into Sonarr and registers it as a Custom Script
+Connect notification on **On Import Complete**. On each import it waits for provider
+identification, asks Jellyfin how many seasons it can join to the series, and refreshes only if
+the answer is zero — then confirms the seasons actually appeared, rather than trusting the 204.
+
+Prerequisites, both in `.env`:
+
+| Variable | What it is |
+| --- | --- |
+| `JELLYFIN_ARR_API_KEY` | Jellyfin API key. The same one the "Jellyfin library update" connector uses. |
+| `JELLYFIN_INTERNAL_URL` | Optional. Jellyfin's address **from inside a container**; defaults to `http://host.docker.internal:8096`. |
+
+Run `docker compose up -d sonarr` after setting them — a plain `restart` does not re-read `.env`.
+
+**`JELLYFIN_INTERNAL_URL` is deliberately not the same setting as `JELLYFIN_URL`.** That one is
+Jellyfin's address from the *host* and is what the stack watch uses; its `localhost:8096` default
+is correct there and meaningless inside a container.
+
+### Two traps that produce a call returning 204 and doing nothing
+
+1. **There is no `recursive` parameter.** Jellyfin 10.11's own OpenAPI spec
+   (`/api-docs/openapi.json`) gives `POST /Items/{id}/Refresh` exactly five query parameters:
+   `metadataRefreshMode`, `imageRefreshMode`, `replaceAllMetadata`, `replaceAllImages` and
+   `regenerateTrickplay`. Guides — including
+   [jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293) — tell you to send
+   `Recursive=true`, and ASP.NET Core silently drops unknown query parameters, so that call is
+   really just a `FullRefresh`. The cascade from a Series to its children is what does the work,
+   and it needs `metadataRefreshMode=FullRefresh`; `Default` is not enough.
+2. **Refreshing too early achieves nothing**, because it re-reads the stale key. Hence the
+   `REFRESH_DELAY` (60s by default) before the script looks at anything.
+
+### Operating it
+
+The connector runs detached — Sonarr executes custom scripts synchronously, and this one
+deliberately sleeps — so its output is in a log inside the container, not in Sonarr's:
+
+```bash
+docker exec sonarr cat /config/jellyfin-refresh/jellyfin-refresh.log
+```
+
+Sonarr logs custom-script output only at **debug** level, so at the default level a broken key is
+silent. `install-jellyfin-refresh.sh` runs the script itself during install for exactly that
+reason, and prints the failure Sonarr would have swallowed.
+
+`REFRESH_DELAY`, `REFRESH_TIMEOUT`, `LOOKUP_TIMEOUT` and `REFRESH_DRYRUN=1` (detect and log, change
+nothing) can be set in sonarr's environment to tune or observe it.
+
+**The deployed copy lives in Sonarr's config volume, which is not in git.** It has to be there:
+`docker-compose.override.yml.example` replaces sonarr's whole `volumes:` list, so a bind mount
+added in `docker-compose.yml` would silently vanish on every host that wants hardlinks, and
+`/config` is the one path both spellings share. Re-run the installer after a `git pull`, and use
+`--check` to see whether the deployed copy has drifted.
+
 ## Links
 
 - [Servarr Wiki](https://wiki.servarr.com/sonarr) · [Quick Start](https://wiki.servarr.com/sonarr/quick-start-guide)

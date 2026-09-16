@@ -50,6 +50,11 @@ monitoring/
   stack_watch.py                    # ntfy alerts for dead containers, host offline, stalled requests
   test_stack_watch.py               # python3 -m unittest discover -s monitoring
   install-stack-watch.sh            # systemd --user timers for the above; see docs/stack-watch.md
+scripts/
+  jellyfin-refresh-series.sh        # Sonarr Custom Script: heals a stranded brand-new series
+  install-jellyfin-refresh.sh       # Installs the above into sonarr + registers the connector
+  test_jellyfin_refresh.py          # python3 -m unittest discover -s scripts
+  mutate_jellyfin_refresh.py        # Mutation check for the above; every mutant must be killed
 docs/                               # Per-service setup guides
 .env.example                        # TZ, PUID/PGID, MEDIA_ROOT, CONFIG_ROOT, SABNZBD_TEMP, TS_AUTHKEY, stack watch
 ```
@@ -279,12 +284,26 @@ shows poster art but no seasons or episodes to play. **Season packs are the comm
 episodes import in one connector fire with no subsequent fire to heal the stale
 `SeriesPresentationUniqueKey`. Individual episode imports self-heal in 5–15 min because later
 connector fires update the children's keys. Since Sonarr prefers season packs, this is the common
-case. Worst-case resolution ≈36 h without intervention. Cheapest repair:
-`POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh`
-([jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293)). A full library scan
-(`POST /Library/Refresh`) also works but is heavier. When debugging "the episode is in Jellyfin but
-Seerr says Processing", check the `/Shows/...` endpoints — `/Items` will happily tell you everything
-is fine.
+case. Worst-case resolution ≈36 h without intervention. The repair is
+`POST /Items/{seriesId}/Refresh?metadataRefreshMode=FullRefresh`, measured at ~20 s. When debugging
+"the episode is in Jellyfin but Seerr says Processing", check the `/Shows/...` endpoints — `/Items`
+will happily tell you everything is fine.
+
+**Wired up as of `scripts/install-jellyfin-refresh.sh`** — a Sonarr Custom Script connector on
+*On Import Complete* that detects the stranding and repairs it automatically. See
+[docs/sonarr.md](./docs/sonarr.md). Two corrections it carries, both of which were repeated as
+fact in this file until they were checked against the running server:
+
+- **There is no `recursive` parameter on `POST /Items/{id}/Refresh`.** Jellyfin 10.11's own
+  OpenAPI spec gives it exactly `metadataRefreshMode`, `imageRefreshMode`, `replaceAllMetadata`,
+  `replaceAllImages`, `regenerateTrickplay`. `Recursive=true` — which
+  [jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293) and every guide recommend —
+  is silently dropped by ASP.NET Core. The call works because a `FullRefresh` on a Series cascades
+  to its children, not because of that flag. `metadataRefreshMode=Default` is **not** sufficient.
+- **A full library scan is not a reliable repair.** A stranded series was observed surviving
+  **two consecutive** `jellyfin-full-scan` runs unchanged, then healing ~20 s after a single
+  `FullRefresh`. Do not reach for `POST /Library/Refresh` as the heavier-but-equivalent option; it
+  is not equivalent.
 
 **SABnzbd's temp-folder free space turning red does not mean the disk is low.** `glitter.main.js`
 colours it whenever the remaining queue exceeds free temp space (`mbleft/1024 > diskspace1`), which is

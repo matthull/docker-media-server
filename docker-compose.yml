@@ -16,6 +16,17 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+      # Read by scripts/jellyfin-refresh-series.sh, the Custom Script connector that heals a
+      # brand-new series Jellyfin imported but could not join to its episodes. Harmless when
+      # unset -- the connector is opt-in and is not registered until you run
+      # scripts/install-jellyfin-refresh.sh. See docs/sonarr.md.
+      #
+      # Deliberately NOT the JELLYFIN_URL that stack_watch.py uses. That one is Jellyfin's
+      # address from the *host*, and its default of http://localhost:8096 is correct there and
+      # meaningless in here, where localhost is this container. Reusing the name would have let
+      # a perfectly reasonable .env silently break the connector.
+      - JELLYFIN_URL=${JELLYFIN_INTERNAL_URL:-http://host.docker.internal:8096}
+      - JELLYFIN_API_KEY=${JELLYFIN_ARR_API_KEY:-}
     ports:
       - 8989:8989
     networks:
