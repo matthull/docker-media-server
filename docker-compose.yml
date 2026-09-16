@@ -72,8 +72,11 @@ services:
   # than produce an unpatched image, so a Renovate bump of its `FROM` cannot silently
   # revert the patch. See images/seerr/README.md and docs/seerr.md.
   #
-  # `pull_policy: build` makes `docker compose up -d` rebuild from the pinned base
-  # instead of reusing the last local build -- without it a base bump would sit unused.
+  # `pull_policy: build` makes a plain `docker compose up -d` rebuild from the pinned
+  # base instead of reusing the last local build -- without it a base bump would sit
+  # unused. It is NOT absolute: `up -d --pull always` and `up -d --no-build` both skip
+  # the build silently and keep running the old image (verified). Update this stack with
+  # a plain `docker compose up -d`.
   # Deliberately no `image:` key: nothing should be able to pull over the built image.
   seerr:
     build:

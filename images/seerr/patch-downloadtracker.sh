@@ -44,14 +44,27 @@ die() {
 
 [ -f "$target" ] || die "$target does not exist -- upstream layout changed"
 
+refresh_re='^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloads();[ 	]*$'
+queue_re='^[ 	]*const queueItems = await [A-Za-z0-9_$]*\.getQueue();[ 	]*$'
+
 before=$(grep -c 'refreshMonitoredDownloads' "$target" || true)
 [ "$before" -eq 2 ] || die "expected exactly 2 refreshMonitoredDownloads references in $target, found $before"
+
+standalone=$(grep -c "$refresh_re" "$target" || true)
+[ "$standalone" -eq 2 ] || die "expected 2 standalone refreshMonitoredDownloads statements, found $standalone"
+
+# Check the PAIR, not just the line. Deleting a statement is only safe if we know what it
+# is attached to: each refresh must be immediately followed by the queue read it precedes.
+# Without this, a refresh that upstream has moved under a braceless `if` would still pass
+# every count check and silently re-bind the following statement into the `if` body.
+paired=$(grep -A1 "$refresh_re" "$target" | grep -c "$queue_re" || true)
+[ "$paired" -eq 2 ] || die "refresh calls are not both immediately followed by the getQueue they guard ($paired of 2) -- upstream restructured this; read the file before touching the regex"
 
 lines_before=$(wc -l <"$target")
 
 # Deletes a whole line of the form `await <ident>.refreshMonitoredDownloads();`.
-# Anchored and whitespace-tolerant, but it will not match a call that has been wrapped,
-# reassigned or inlined -- in which case the count checks below fail the build.
+# Kept literal rather than interpolating $refresh_re, so the expression sed sees is the one
+# written here and not the result of a shell expansion.
 sed -i '/^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloads();[ 	]*$/d' "$target"
 
 after=$(grep -c 'refreshMonitoredDownloads' "$target" || true)

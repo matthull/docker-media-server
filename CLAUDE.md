@@ -330,6 +330,11 @@ back to `image:` — see `images/seerr/README.md` for the measurements and for w
 silently revert it. If a bump makes `docker compose up -d` fail in the patch script, that is the
 design working: read the new `downloadtracker.js` and update the `sed`, don't bypass it.
 
+**Update this stack with a plain `docker compose up -d`.** `--pull always` and `--no-build` both skip
+the build silently (exit 0, no warning) and keep the old image, which leaves `seerr` on a stale base
+with everything reporting healthy. Nothing asserts the patch at runtime — Seerr's healthcheck passes
+identically on an unpatched image.
+
 `prowlarr` is deliberately on a `-nightly` tag — moving to stable is a **downgrade across a database
 migration**, which Prowlarr does not support and which needs a restore from
 `${CONFIG_ROOT}/config/prowlarr/Backups/`, not just an image swap.

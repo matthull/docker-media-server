@@ -109,8 +109,17 @@ success, because the front of the library keeps working. TMDB is not a constrain
 ## "Unable to get queue from Radarr/Sonarr server" — raise `apiRequestTimeout` to 45000
 
 The Download Tracker logs `Unable to get queue from Radarr server: Radarr` (and the Sonarr twin) on
-its one-minute cycle, and the requester sees no download progress at all — just "Processing" until
-the title appears. Set **Settings > Networking > API request timeout to 45000** (`network.apiRequestTimeout`
+its one-minute cycle.
+
+**Correction to what the requester sees.** This section used to say they see no progress at all. That
+is wrong: the shared `catch` only logs, `this.radarrServers[server.id]` is assigned solely on success
+and never cleared on failure, and `resetDownloadTracker()` is a separate job on `0 0 1 * * *`. So a
+failed cycle **freezes** the card on the previous snapshot — a stale percentage and a stale ETA —
+until a cycle succeeds. It shows nothing at all only for a download whose first tracker cycles all
+failed, which is the "Processing until the title appears" case. A confidently wrong ETA is arguably
+worse than a blank one.
+
+Set **Settings > Networking > API request timeout to 45000** (`network.apiRequestTimeout`
 in `config/jellyseerr/settings.json`) and restart the container.
 
 **Why it happens.** The tracker calls `refreshMonitoredDownloads()` — `POST /api/v3/command`, a
@@ -180,8 +189,11 @@ every container still reporting healthy. Three things make that impossible here,
 - the patch is in git, so it travels with the repo;
 - the patch script asserts the call sites before and after editing and **fails the build** if it
   cannot patch, so no unpatched image is ever produced — the last good one keeps serving;
-- `pull_policy: build` makes `docker compose up -d` rebuild from the pinned base, so a bump actually
-  reaches the container instead of sitting unused.
+- `pull_policy: build` makes a plain `docker compose up -d` rebuild from the pinned base, so a bump
+  actually reaches the container instead of sitting unused. **Not absolute:** `up -d --pull always`
+  and `up -d --no-build` both skip the build silently and keep the old image running (verified, exit
+  0, no warning). That yields a stale base, never an unpatched Seerr — but update with a plain
+  `docker compose up -d`, and note that nothing asserts the patch at runtime yet.
 
 Dropping the write is safe because **both arrs already run `RefreshMonitoredDownloads` themselves
 every 1 minute** (`GET /api/v3/system/task`), the same cadence as Seerr's own Download Sync job.

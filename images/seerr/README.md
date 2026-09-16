@@ -26,9 +26,16 @@ Measured on this host while a season pack was downloading:
 download, either arr. Only the write ever blocks.
 
 When the `POST` outruns Seerr's `network.apiRequestTimeout` the whole cycle is abandoned in the
-shared `catch`, Seerr logs `Unable to get queue from <arr> server`, and **download progress
-disappears from the UI** — exactly while someone is watching the thing they just requested, because
-the contention is caused by that very download.
+shared `catch`, and Seerr logs `Unable to get queue from <arr> server` — exactly while someone is
+watching the thing they just requested, because the contention is caused by that very download.
+
+**What the requester actually sees is a frozen progress bar, not a missing one.** The `catch` only
+logs: `this.radarrServers[server.id]` is assigned solely on success and is never cleared on failure,
+and `resetDownloadTracker()` is a separate job on `0 0 1 * * *` (daily at 01:00). So a failed cycle
+leaves the *previous* snapshot in place and the card keeps showing a stale percentage and a
+stale ETA until a cycle succeeds. The bar is genuinely absent only for a download whose very first
+tracker cycles all failed. Earlier notes in this repo said progress "disappears"; that was wrong,
+and arguably understated the problem — a confidently wrong ETA is worse than a missing one.
 
 Raising the timeout is a palliative, and it was tried first: at `45000`, a live 90-minute window
 still lost **15 of 90 cycles (16.7%)**. The tail grows with the download, so no timeout value is the
@@ -72,6 +79,22 @@ The arrangement here cannot do that:
 
 Both guard directions are tested, not assumed — see the negative controls below.
 
+### The one way to get a stale base anyway
+
+**`docker compose up -d --pull always` and `--no-build` both skip the build silently.** Verified: with
+a changed `FROM`, `up -d --pull always` printed only `Container … Running`, exit 0, no build, no
+recreate, no warning, and the container kept running the old base. `--no-build` likewise succeeded
+while the patch script was rigged to fail.
+
+This cannot produce an *unpatched* Seerr — the image reused is the patched one — but it can leave the
+base stale indefinitely with everything reporting healthy. It matters because
+`docker compose pull && docker compose up -d --pull always` is a common stock update recipe.
+
+**Update this stack with a plain `docker compose up -d`.** Nothing in the image asserts the patch at
+runtime: Seerr's healthcheck (`/api/v1/status`) passes identically on an unpatched image. The check
+that closes this is `docker exec seerr grep -c refreshMonitoredDownloads /app/dist/lib/downloadtracker.js`
+returning 0, which belongs in `monitoring/stack_watch.py` and is not there yet.
+
 ## Verifying
 
 ```sh
@@ -91,11 +114,20 @@ measure during a real import.
 
 The build guards were proven to fail, not just to pass:
 
-| Control                                        | Result                                                      |
-| ---------------------------------------------- | ----------------------------------------------------------- |
-| Base with the call sites already gone           | build failed: `expected exactly 2 ... found 0`               |
-| Base with the calls moved behind `this.`        | build failed: `2 reference(s) survived the patch`            |
-| Real base                                       | build succeeded; diff is exactly the two deleted lines       |
+| Control                                          | Result                                                     |
+| ------------------------------------------------ | ---------------------------------------------------------- |
+| Base with the call sites already gone             | build failed: `expected exactly 2 ... found 0`              |
+| Base with the calls moved behind `this.`          | build failed: `2 reference(s) survived the patch`           |
+| Calls moved under a braceless `if`, expression statement following | build failed: `not both immediately followed by the getQueue they guard` |
+| Real base                                         | build succeeded; diff is exactly the two deleted lines      |
+
+The third control came out of a fresh-context review and is the reason the pair check exists. The
+original guards only proved the calls were *gone*, not that removing them was *safe*: a refresh moved
+under a braceless `if` passed `before=2`, `after=0`, `removed=2` and `node --check` while silently
+re-binding the next statement into the `if` body. That fixture is valid JavaScript, so nothing would
+have complained. Today's file happens to be protected because a `const` declaration follows (which
+`node --check` does reject there) — protection by luck, not by design. The pair check requires each
+refresh to be immediately followed by the `const queueItems = await <arr>.getQueue();` it precedes.
 
 ## What is not established
 
