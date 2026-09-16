@@ -42,9 +42,9 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("D6", 'problems[f"disk:{role}"] = f"disk: can\'t read free space for the {role} path"',
      'problems[f"disk:{role}"] = f"disk: can\'t read free space: {exc}"',
      "leaks the OS error text to the public topic"),
-    ("D7", "        except OSError as exc:\n            if not configured:",
+    ("D7", '        except OSError as exc:\n            if not configured and f"disk:{role}" not in floors:',
      "        except OSError as exc:\n            raise WatchError('x') from exc\n"
-     "            if not configured:",
+     '            if not configured and f"disk:{role}" not in floors:',
      "one unreadable path kills the container and Jellyfin checks too"),
     ("D8", 'if minimum < SIZE_UNITS["G"]:', "if minimum < 0:",
      "accepts 0G, which silently disables the check"),
@@ -59,8 +59,10 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "a whitespace-only setting is parsed instead of defaulting"),
     ("D11", 'if text.lower() == "off":', 'if text == "off":', '"OFF" and "Off" stop meaning off'),
     ("D11b", 'if text.lower() == "off":', 'if text.lower() == "OFF":', '"off" stops meaning off'),
-    ("D12", "        problems |= disk_problems(watch.cfg, minimum, floors if floors is not None else {})",
-     "        disk_problems(watch.cfg, minimum, floors if floors is not None else {})",
+    ("D12", "        problems |= disk_problems(watch.cfg, minimum, floors if floors is not None else {},\n"
+            "                                  free_now=free_now)",
+     "        disk_problems(watch.cfg, minimum, floors if floors is not None else {},\n"
+     "                      free_now=free_now)",
      "the disk check runs but its result is thrown away"),
     ("D13", "    if minimum is not None:", "    if minimum is None:",
      "the check is inverted: on when off, off when on"),
@@ -148,9 +150,17 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     # --- the fallback Compose applies when SABNZBD_TEMP is blank
     ("F1", "path = configured or fallback", "path = configured",
      "a blank SABNZBD_TEMP watches nothing, while Compose still mounts its default"),
-    ("F2", "            if not configured:\n                # Compose's fallback",
+    ("F2", '            if not configured and f"disk:{role}" not in floors:\n'
+           "                # Compose's fallback",
      "            if False:\n                # Compose's fallback",
      "an absent fallback path is alerted on as if the user had asked for it"),
+    # --- ...but only while it isn't already a problem, or its silence reads as recovery
+    ("F7", '            if not configured and f"disk:{role}" not in floors:',
+     "            if not configured:",
+     "a vanished fallback decays into an all clear that names it as 'Cleared'"),
+    ("F8", '            if not configured and f"disk:{role}" not in floors:',
+     '            if f"disk:{role}" not in floors:',
+     "a configured path that has never been low is skipped instead of reported unreadable"),
     ("F3", '("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd-temp")',
      '("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd")',
      "the fallback drifts from the one docker-compose.yml applies"),
@@ -159,8 +169,8 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "a wedged filesystem is not given up on, so the whole run is SIGTERMed"),
     ("T2", '    if "error" in outcome:', "    if False:",
      "a real error is reported as a timeout instead of itself"),
-    ("T3", "        except OSError as exc:\n            if not configured:",
-     "        except FileNotFoundError as exc:\n            if not configured:",
+    ("T3", '        except OSError as exc:\n            if not configured and f"disk:{role}" not in floors:',
+     '        except FileNotFoundError as exc:\n            if not configured and f"disk:{role}" not in floors:',
      "a timed-out read escapes instead of reading as an unreadable path"),
     # --- re-sending a standing problem, so it isn't announced once and then never again
     ("N1", "    if unchanged and not (current and not going and not sent):", "    if unchanged:",
@@ -174,10 +184,8 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("N4b", '        message += "\\n\\nStill not resolved."',
      '        message += f"\\n\\nUnchanged."',
      "a repeat claims nothing changed, to someone who may have just freed 60G"),
-    ("N5", "        current, watch.host, worsened, [d for k, d in shown.items() if k not in current],\n"
-           "        unchanged, min([t for t in started if t], default=None))",
-     "        current, watch.host, worsened, [d for k, d in shown.items() if k not in current],\n"
-     "        True, min([t for t in started if t], default=None))",
+    ("N5", "        unchanged, min([t for t in started if t], default=None), free_now)",
+     "        True, min([t for t in started if t], default=None), free_now)",
      "'Still not resolved' is stamped on genuinely new and worsening alerts too"),
     ("U1", '            "sent", [watch.now.isoformat()] if state["stack"].get("shown") else [])',
      '            "sent", [])',
@@ -186,12 +194,34 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      '            "sent", [watch.now.isoformat()])',
      "a first install spends a slot of the daily cap on a notification that never went out"),
     # --- what the notification actually says
-    ("C1", "        if cleared:  # distinct", "        if False:  # distinct",
+    ("C1", '                "Everything that was down is back up." + cleared_lines(cleared), LOW)',
+     '                "Everything that was down is back up.", LOW)',
      "the all clear never names what recovered, which is a ratcheted disk's only acknowledgement"),
-    ("C1b", 'for d in sorted(set(cleared))', "for d in sorted(cleared)",
-     "one drive shared by both roles is listed twice in the all clear"),
-    ("C2", "lines = sorted(set(current.values()))", "lines = sorted(current.values())",
+    ("C1b", "    gone = sorted(set(cleared))", "    gone = sorted(cleared)",
+     "one drive shared by both roles is listed twice among what recovered"),
+    ("C2", '    lines = sorted({description + (f" (now {size(free_now[key], MEASURED)} free)"\n'
+           '                                   if key in free_now else "")\n'
+           "                    for key, description in current.items()})",
+     '    lines = sorted([description + (f" (now {size(free_now[key], MEASURED)} free)"\n'
+     '                                   if key in free_now else "")\n'
+     "                    for key, description in current.items()])",
      "a single drive shared by both roles reports the same problem twice"),
+    # --- a recovery while other problems remain, which used to be dropped without a word
+    ("C4", '    message = "\\n".join(f"• {line}" for line in lines) + cleared_lines(cleared)',
+     '    message = "\\n".join(f"• {line}" for line in lines)',
+     "a problem recovering is erased unless it was the last one, so a partial recovery goes unsaid"),
+    ("C5", "    return \"\\n\\nCleared:\\n\" + \"\\n\".join(f\"• {d}\" for d in gone) if gone else \"\"",
+     '    return "\\n\\nCleared:\\n" + "\\n".join(f"• {d}" for d in gone)',
+     "an empty 'Cleared:' header is stamped on every notification that cleared nothing"),
+    # --- the current free figure, carried beside the ratcheted sentence rather than inside it
+    ("W1", "            if free_now is not None:\n                free_now[key] = free",
+     "            if False:\n                free_now[key] = free",
+     "a settled sentence re-sent a day later still reads as a claim about right now"),
+    ("W2", "            if free_now is not None:\n                free_now[key] = free",
+     "            if free_now is not None:\n                free_now[key] = level",
+     "the 'now' figure is the ratcheted low point again, so it can never disagree with the sentence"),
+    ("W3", "    free_now: dict[str, int] = {}", '    free_now: dict = state.setdefault("free_now", {})',
+     "a figure read on an earlier run is carried over and quoted as this run's"),
     ("C3", '                        tags=("white_check_mark",) if not current\n'
            '                        else ("rotating_light",) if worsened else ("warning",))',
      '                        tags=("rotating_light",) if worsened else ("white_check_mark",))',
@@ -205,8 +235,13 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("S3", '(("T", SIZE_UNITS["T"]), ("G", SIZE_UNITS["G"]), ("M", SIZE_UNITS["M"]))',
      '(("M", SIZE_UNITS["M"]), ("G", SIZE_UNITS["G"]), ("T", SIZE_UNITS["T"]))',
      "renders 100G as 102400M"),
-    ("S4", 'return f"{nbytes / scale:.10g}{unit}"', 'return f"{nbytes / scale:.1g}{unit}"',
+    ("S4", 'def size(nbytes: float, precision: str = ".10g") -> str:',
+     'def size(nbytes: float, precision: str = ".1g") -> str:',
      "rounds 102.4T to 100T and 1.5G to 2G"),
+    ("S5", 'MEASURED = ".4g"', 'MEASURED = ".10g"',
+     "a measured free-space figure goes out as 142.5914421G"),
+    ("S6", 'MEASURED = ".4g"', 'MEASURED = ".3g"',
+     "1023.9G free renders as the exponent 1.02e+03G"),
     # --- the stack notification's priority, which the ratchet made load-bearing
     ("P1", "    worsened = bool(current.keys() - shown.keys()) or any(\n"
            "        current[key] != shown[key] for key in current.keys() & shown.keys())",

@@ -20,7 +20,7 @@ new account.
 
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
-| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new or worse, else Default |
+| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them, and says what it has free now. Names anything that recovered in the same breath | High if new or worse, else Default |
 | *(the same notification, re-sent)* | The same problems are still unresolved a day later. Not a separate alert — same title, replaced in place | Default |
 | **… all clear** | Everything above has been fine for two checks. Names what recovered | Low |
 | ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
@@ -41,7 +41,14 @@ new account.
   the usual `/tmp` tmpfs is. It could never have that much free, so watching it would be a standing
   alert nobody can clear, on the same notification as the real library-full one; it is skipped with a
   line in the journal instead. A path you configured yourself is always watched as asked, whatever
-  its size. If the fallback directory doesn't exist, nothing is watched and nothing is said.
+  its size. If the fallback directory doesn't exist, nothing is watched and nothing is said — but
+  only while it isn't already a problem. Once it is, the path going quiet is *not* recovery, and it
+  is reported as unreadable rather than dropped; dropping it would let the problem decay into an all
+  clear naming it as "Cleared", on the strength of nothing but the path having stopped answering.
+  (One case is deliberately left the other way: a fallback that has become *too small* for the
+  threshold while it was already a problem is dropped, and does send that false "Cleared". Holding it
+  would be the standing unclearable alert above. It takes raising `DISK_FREE_MIN` past the whole size
+  of the fallback filesystem, or moving the fallback onto a small one, and the journal says so.)
   It reports the *lowest* step the drive has been under since the
   problem began — `DISK_FREE_MIN`, then half, a quarter and a tenth of it — never the figure itself,
   and never moving back up until the all clear releases it. That is why it says "dropped below": free
@@ -52,6 +59,13 @@ new account.
   the daily cap for the fall that followed. SABnzbd pausing at its own `download_free` and resuming
   when space returns is a mechanism for producing exactly that wobble, around exactly that number.
   Ratcheted, the same wobble sends one, and the fall afterwards still gets each remaining step.
+  What the ratchet costs is that the sentence is about the low point, not about now, and after a day
+  it reads as though it were about now. So every disk line also quotes what the drive actually has —
+  `disk: dropped below 10G free for the library (now 70G free)`. The figure is carried *beside* the
+  sentence and never inside it: in it, it would change on nearly every check and bring the wobble
+  back. It is read fresh each run, so a drive that stopped answering has no figure rather than
+  yesterday's, and it is rounded to four significant digits, because a filesystem answers with all of
+  them (`142.5914421G` is what one live check produced before that was fixed).
   Neither path is named: the topic is public and the paths name your home directory. A configured
   path that can't be read is reported as `disk: can't read free space for the … path`, and a drive
   that has spun down or gone stale is given up on after 20 seconds rather than blocking the run —
@@ -76,12 +90,20 @@ new account.
   It says "still not resolved" and not "unchanged" on purpose — the report ratchets to the low point
   of the episode, so someone who has just freed 60G and is still under `DISK_FREE_MIN` sees the same
   sentence as before, and should not also be told that nothing has changed.
-- **The all clear names what recovered** — but only when *everything* tracked clears at once. If some
-  problems recover while others remain, the notification silently drops the recovered ones from the
-  list with no acknowledgement at all; only a full all clear currently says what cleared. Because the
-  disk report ratchets, freeing 60G to go from 10G to 70G free changes nothing until `DISK_FREE_MIN`
-  itself is cleared, so for the disk specifically the all clear is the only acknowledgement a recovery
-  gets and it has to say what it is acknowledging.
+- **A recovery is named whether or not it is the last one.** A notification that still has problems
+  ends with a `Cleared:` block listing what stopped, and the all clear does the same. It used to be
+  only the all clear, so a problem recovering while another remained was erased — the bullet stopped
+  appearing, in a notification whose title went from "3 problems" to "2 problems" and said nothing
+  about which. Because the disk report ratchets, freeing 60G to go from 10G to 70G free changes
+  nothing until `DISK_FREE_MIN` itself is cleared, so for the disk this is the only acknowledgement a
+  recovery gets, and waiting for the *last* problem to go made it the system's schedule rather than
+  yours.
+- **A role moving to a different drive goes out at High**, even when the new drive is healthier. The
+  floor deliberately belongs to a filesystem and not to a role, so moving `MEDIA_ROOT` from a drive
+  at 5G to one at 60G re-reports from the top step, and any changed description counts as worsening.
+  Ranking the two would mean comparing a level measured on one drive against a level measured on
+  another, which is the falsehood the per-filesystem floor exists to prevent. The drive really is
+  under the threshold; the line says what it actually has.
 - **The wanted-titles digest** lists monitored movies and episodes with no file and nothing in the
   download queue, `STALL_DAYS` after they were added or released, whichever is later. New titles come
   first. Each title gets a reminder every `STALL_REMIND_DAYS`, at most twice.
@@ -259,13 +281,42 @@ Run these from the repo root, one step at a time.
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
 
-6. **Stalled digest**, treating everything wanted as overdue:
+6. **A recovery while another problem remains**, and the figure each drive has now. Point the two
+   roles at two different filesystems, put both under an impossible threshold, then lower it so only
+   one is still under. `/tmp` is a separate filesystem on most hosts; check with `df` first.
+
+   ```bash
+   export SABNZBD_TEMP=/tmp HEARTBEAT_GRACE=off
+   DISK_FREE_MIN=1024T python3 monitoring/stack_watch.py check --test   # x2: "2 problems"
+   DISK_FREE_MIN=100G python3 monitoring/stack_watch.py check --test    # x2: "1 problem" + "Cleared:"
+   ```
+
+   Each disk line should end in `(now …G free)` with a rounded figure, and the line for a drive that
+   was *not* read on that run should have no figure at all rather than the previous one.
+
+7. **A vanished fallback**, which must not read as a recovery. This needs a threshold the fallback
+   filesystem is under but is not *smaller* than (or it is skipped as unwatchable), so read `df -B1`
+   on it and pick a size between its free and its total.
+
+   ```bash
+   export SABNZBD_TEMP= HEARTBEAT_GRACE=off DISK_FREE_MIN=15.4G   # sized from df, see above
+   python3 monitoring/stack_watch.py check --test                 # x2: it alerts
+   mv /tmp/sabnzbd-temp /tmp/sabnzbd-temp.aside
+   python3 monitoring/stack_watch.py check --test                 # x3
+   mv /tmp/sabnzbd-temp.aside /tmp/sabnzbd-temp
+   ```
+
+   The right answer is `disk: can't read free space for the downloads path` and **no all clear**.
+   Only do this while `SABNZBD_TEMP` is really set in `.env` to something else, so the path you are
+   moving is not one the running stack has mounted.
+
+8. **Stalled digest**, treating everything wanted as overdue:
 
    ```bash
    STALL_DAYS=0 python3 monitoring/stack_watch.py stalled --test
    ```
 
-7. **The watch failing**, with a setting it rejects, twice, then a clean run for "working again":
+9. **The watch failing**, with a setting it rejects, twice, then a clean run for "working again":
 
    ```bash
    HEARTBEAT_GRACE=never python3 monitoring/stack_watch.py check --test
@@ -317,14 +368,8 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   otherwise. Worth knowing when `MEDIA_ROOT` moves onto its own drive.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
-- **A partial recovery, when other problems remain.** The all clear names what recovered, but only
-  when *every* tracked problem clears in the same run. If one problem recovers while another is still
-  active, the "N problems" notification silently drops the recovered one from its list with no
-  acknowledgement — confirmed live, not just in a unit test. Fix inscribed: opus
-  `close-four-remaining-disk-alert-gaps-in`.
-- **An inferred fallback path vanishing while it was a real, alerted disk problem.** `SABNZBD_TEMP`
-  left blank watches Compose's fallback; if that path later becomes unreadable (removed, unmounted),
-  the check reads it the same as "not configured" and stops watching it silently. An already-alerted
-  problem on that filesystem then decays through absence and is reported as a genuine all clear
-  ("Cleared: …") even though free space was never actually confirmed to have recovered — only that the
-  path stopped answering. Confirmed live. Fix inscribed: opus `close-four-remaining-disk-alert-gaps-in`.
+- **An inferred fallback that becomes too small for the threshold while it is already a problem.**
+  It stops being watched, and that reads as a recovery it never had. The alternative is the standing
+  unclearable alert the size check exists to remove, so this one is deliberate rather than open; see
+  the disk bullet above. It takes raising `DISK_FREE_MIN` past the fallback filesystem's whole size,
+  or moving the fallback onto a small one.

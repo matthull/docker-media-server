@@ -172,6 +172,19 @@ class SizeTest(unittest.TestCase):
             for unit in "MGT":
                 self.assertEqual(sw.size(sw.parse_size(f"{count}{unit}")), f"{count}{unit}")
 
+    def test_a_measured_figure_is_rounded_to_something_readable_on_a_phone(self):
+        """Every other size here is derived from DISK_FREE_MIN and lands on a round number. Free
+        space is read off the filesystem and does not: a live check on this host rendered
+        "142.5914421G free", which the whole test suite missed because every drive in it is a round
+        number of gigabytes. Four significant digits, because a value needing five in one unit has
+        already reached the next one, so this is also the widest that never turns into an exponent."""
+        self.assertEqual(sw.size(153106874368, sw.MEASURED), "142.6G")
+        self.assertEqual(sw.size(16374452224, sw.MEASURED), "15.25G")
+        self.assertEqual(sw.size(5 * 1024 ** 3, sw.MEASURED), "5G")
+        # The widest value each unit can hold, which is where %g reaches for an exponent.
+        self.assertEqual(sw.size(1024 ** 4 - 1, sw.MEASURED), "1024G")
+        self.assertEqual(sw.size(1024 ** 3 - 1, sw.MEASURED), "1024M")
+
 
 class ScheduleTest(unittest.TestCase):
     def test_check_timer_runs_every_check_interval(self):
@@ -646,6 +659,34 @@ class DiskTest(unittest.TestCase):
             self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "/lib"}, 100 * GB, {}, reader), {})
         self.assertEqual(log.getvalue(), "")
 
+    def test_a_fallback_that_goes_quiet_mid_problem_is_unknown_not_recovered(self):
+        """The same absent path as above, once it is already a problem, is a different fact. Skipping
+        it there drops the problem, advance() decays it, and the all clear names it as "Cleared" — a
+        recovery announced on the strength of the path having stopped answering, which is as close to
+        a missed alert as this check gets. A floor is exactly the roles that were a problem last run,
+        so it is what tells the two apart."""
+        reader = free_space(("/lib", (1, 500 * GB)))
+        floors = {"disk:downloads": {"device": 2, "level": 10 * GB}}
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            problems = sw.disk_problems({"MEDIA_ROOT": "/lib"}, 100 * GB, floors, reader)
+        self.assertEqual(problems,
+                         {"disk:downloads": "disk: can't read free space for the downloads path"})
+        self.assertIn("SABNZBD_TEMP", log.getvalue())  # and now it is worth a journal line
+        self.assertEqual(floors["disk:downloads"], {"device": 2, "level": 10 * GB})
+
+    def test_the_current_figure_is_collected_beside_the_ratcheted_one(self):
+        """Separately from the description, which is the whole point: the ratchet exists because free
+        space is the one quantity here that varies continuously, and a varying description republishes
+        the stack notification. Collected per role, so two roles on one drive still say one thing."""
+        floors, free_now = {}, {}
+        self.problems(100 * GB, (1, 5 * GB), (1, 5 * GB), floors)
+        settled = self.problems(100 * GB, (1, 70 * GB), (1, 70 * GB), floors)
+        sw.disk_problems(DISK_CFG, 100 * GB, dict(floors),
+                         free_space(("/lib", (1, 70 * GB)), ("/dl", (1, 70 * GB))), free_now)
+        self.assertEqual(set(settled.values()),  # the sentence has not moved: 10G, as it should
+                         {"disk: dropped below 10G free for the library and downloads"})
+        self.assertEqual(free_now, {"disk:library": 70 * GB, "disk:downloads": 70 * GB})
+
     def test_moving_downloads_to_its_own_drive_keeps_the_librarys_key_and_floor(self):
         """The key used to be built from the role set, so disk:library+downloads retired and two new
         keys appeared the moment the paths split: a spurious rotating_light "new problem", a floor
@@ -980,6 +1021,49 @@ class PublishStackTest(unittest.TestCase):
              f"Everything that was down is back up.\n\nCleared:\n• a: exited\n• {one_drive}",
              ["white_check_mark"])])
 
+    def test_a_recovery_is_named_while_other_problems_remain(self):
+        """The all clear used to be the only place a recovery was named, so a partial one was erased:
+        the bullet simply stopped appearing, in a notification whose title changed from "3 problems"
+        to "2 problems" and said nothing about which. The disk is why this matters most — its report
+        ratchets, so a recovery is acknowledged by nothing else at all — but a container coming back
+        while another is still down is the same silence."""
+        stack = {"shown": {"a": "a: exited", "b": "b: unhealthy",
+                           "disk:library": "disk: dropped below 10G free for the library"},
+                 "sent": []}
+        _, sent = self.publish({"a": "a: exited"}, stack)
+        self.assertEqual([(m["title"], m["message"], m["priority"], m["tags"]) for m in sent], [
+            ("Media stack on h: 1 problem",
+             "• a: exited\n\nCleared:\n• b: unhealthy\n"
+             "• disk: dropped below 10G free for the library", sw.DEFAULT, ["warning"])])
+
+    def test_one_drive_shared_by_both_roles_recovers_as_one_line(self):
+        """As in the all clear: the check keys per role and words a shared drive once, so listing per
+        key would name the same drive twice in the same breath."""
+        one_drive = "disk: dropped below 10G free for the library and downloads"
+        stack = {"shown": {"disk:library": one_drive, "disk:downloads": one_drive,
+                           "a": "a: exited"}, "sent": []}
+        _, sent = self.publish({"a": "a: exited"}, stack)
+        self.assertEqual([m["message"] for m in sent], [f"• a: exited\n\nCleared:\n• {one_drive}"])
+
+    def test_nothing_is_added_when_a_problem_set_only_grows(self):
+        """A new problem beside an old one has nothing to acknowledge, and an empty "Cleared:" header
+        would be worse than none."""
+        stack = {"shown": {"a": "a: exited"}, "sent": []}
+        _, sent = self.publish({"a": "a: exited", "b": "b: unhealthy"}, stack)
+        self.assertEqual([m["message"] for m in sent], ["• a: exited\n• b: unhealthy"])
+
+    def test_a_ratcheted_disk_sentence_quotes_what_the_drive_has_now(self):
+        """The sentence is held at the episode's low point so it stops republishing, which means a
+        re-send a day later can describe 10G to someone now sitting at 70G and read as a claim about
+        the present. The figure is carried beside it rather than in it: in it, the description would
+        change on nearly every run and the flap the ratchet removed would be back."""
+        one_drive = "disk: dropped below 10G free for the library and downloads"
+        current = {"disk:library": one_drive, "disk:downloads": one_drive}
+        title, message, _ = sw.format_check(current, "h", False, free_now={
+            "disk:library": 70 * GB, "disk:downloads": 70 * GB})
+        self.assertEqual((title, message),
+                         ("Media stack on h: 1 problem", f"• {one_drive} (now 70G free)"))
+
     def test_daily_cap_mutes_updates_until_a_day_after_the_oldest(self):
         times = [NOW - 23 * HOUR + n * MIN for n in range(11)] + [NOW - 25 * HOUR]
         stack, sent = self.publish({"a": "a: exited"}, {"shown": {}, "sent": [t.isoformat() for t in times]})
@@ -1156,7 +1240,11 @@ class RunCheckTest(unittest.TestCase):
             (15, "Media stack on h: 1 problem", "• sonarr: exited (code 1)"),
             (45, "Media stack on h: 2 problems",
              "• docker: not responding (details in the journal)\n• sonarr: exited (code 1)"),
-            (105, "Media stack on h: 1 problem", "• sonarr: exited (code 1)"),
+            # Docker coming back is named, not silently dropped from the list: the artifex is being
+            # told the stack is down to one problem, and which one stopped is the half of that he
+            # can act on.
+            (105, "Media stack on h: 1 problem", "• sonarr: exited (code 1)\n\nCleared:\n"
+             "• docker: not responding (details in the journal)"),
         ])
 
     def test_services_are_kept_while_the_compose_file_is_unreadable(self):
@@ -1253,7 +1341,8 @@ class RunCheckTest(unittest.TestCase):
             self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
             [sent] = self.check(state, healthy, 15 * MIN, cfg)
         self.assertEqual(sent["title"], "Media stack on h: 1 problem")
-        self.assertEqual(sent["message"], "• disk: dropped below 50G free for the library")
+        self.assertEqual(sent["message"],
+                         "• disk: dropped below 50G free for the library (now 30G free)")
         self.assertNotIn("SENTINEL", json.dumps(sent))
 
     def test_a_worsening_step_is_not_dressed_as_good_news(self):
@@ -1269,8 +1358,10 @@ class RunCheckTest(unittest.TestCase):
             for minutes in (30, 45):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
         self.assertEqual([(m["message"], m["priority"], m["tags"]) for m in sent], [
-            ("• disk: dropped below 100G free for the library", sw.HIGH, ["rotating_light"]),
-            ("• disk: dropped below 25G free for the library", sw.HIGH, ["rotating_light"])])
+            ("• disk: dropped below 100G free for the library (now 60G free)",
+             sw.HIGH, ["rotating_light"]),
+            ("• disk: dropped below 25G free for the library (now 20G free)",
+             sw.HIGH, ["rotating_light"])])
 
     def test_a_drive_wobbling_across_a_step_does_not_burn_the_daily_cap(self):
         """SABnzbd pauses at its own floor and resumes when space returns, so free space oscillates
@@ -1283,17 +1374,19 @@ class RunCheckTest(unittest.TestCase):
             for minutes in range(0, 12 * 60, 15):
                 drive.free = (52 if (minutes // 15) % 2 else 48) * GB
                 sent += self.check(state, healthy, minutes * MIN, cfg)
-            # 48 checks over 12 hours; undamped this alternated 10 times.
+            # 48 checks over 12 hours; undamped this alternated 10 times. The one that goes out is
+            # sent on an up-swing, and says so: the ratchet's 50G is where the drive has been, "now
+            # 52G free" is where it is, and only the first of those is allowed to move the alert.
             self.assertEqual([m["message"] for m in sent],
-                             ["• disk: dropped below 50G free for the library"])
+                             ["• disk: dropped below 50G free for the library (now 52G free)"])
             # ...and the fall that follows is still heard, because the cap was not spent on noise.
             for index, free in enumerate(range(48, -1, -3)):
                 drive.free = free * GB
                 sent += self.check(state, healthy, (12 * 60 + index * 15) * MIN, cfg)
         self.assertEqual([m["message"] for m in sent],
-                         ["• disk: dropped below 50G free for the library",
-                          "• disk: dropped below 25G free for the library",
-                          "• disk: dropped below 10G free for the library"])
+                         ["• disk: dropped below 50G free for the library (now 52G free)",
+                          "• disk: dropped below 25G free for the library (now 24G free)",
+                          "• disk: dropped below 10G free for the library (now 9G free)"])
 
     def test_the_floor_is_released_once_the_drive_recovers(self):
         """Otherwise the next time it dipped it would still claim the old low point."""
@@ -1312,7 +1405,7 @@ class RunCheckTest(unittest.TestCase):
             for minutes in (75, 90):
                 sent = self.check(state, healthy, minutes * MIN, cfg)
         self.assertEqual([m["message"] for m in sent],
-                         ["• disk: dropped below 100G free for the library"])
+                         ["• disk: dropped below 100G free for the library (now 90G free)"])
 
     def test_a_drive_parked_below_the_threshold_is_heard_again_a_day_later(self):
         """A settled problem used to be announced exactly once, ever — publish_stack returns early on
@@ -1329,7 +1422,7 @@ class RunCheckTest(unittest.TestCase):
         self.assertEqual([(at, m["tags"]) for at, m in sent],
                          [(15 * MIN, ["rotating_light"]), (25 * HOUR, ["warning"])])
         self.assertEqual(sent[1][1]["message"],
-                         "• disk: dropped below 10G free for the library\n\n"
+                         "• disk: dropped below 10G free for the library (now 5G free)\n\n"
                          f"Still not resolved. First seen {sw.when(NOW)}.")
 
     def test_moving_downloads_to_its_own_drive_is_not_a_new_problem(self):
@@ -1354,13 +1447,92 @@ class RunCheckTest(unittest.TestCase):
                 sent += self.check(state, healthy, minutes * MIN, cfg)
         self.assertEqual([(m["title"], m["message"]) for m in sent], [
             ("Media stack on h: 1 problem",
-             "• disk: dropped below 25G free for the library and downloads"),
+             "• disk: dropped below 25G free for the library and downloads (now 20G free)"),
             ("Media stack on h: 2 problems",
-             "• disk: dropped below 25G free for the downloads\n"
-             "• disk: dropped below 25G free for the library")])
+             "• disk: dropped below 25G free for the downloads (now 20G free)\n"
+             "• disk: dropped below 25G free for the library (now 20G free)")])
         self.assertEqual(state["disk"], {"disk:library": {"device": 1, "level": 25 * GB},
                                          "disk:downloads": {"device": 2, "level": 25 * GB}})
         self.assertEqual(set(state["tracked"]), {"disk:library", "disk:downloads"})
+
+    def test_a_fallback_that_vanishes_never_becomes_a_false_all_clear(self):
+        """End to end, which is where this one actually bites: the skip is in disk_problems, the
+        damage is two runs later in publish_stack. Compose's tmpfs going away used to read as the
+        downloads drive recovering — "Everything that was down is back up. Cleared: disk: dropped
+        below 10G free for the downloads" — when nothing had been freed and the path had simply
+        stopped answering."""
+        state, cfg = {}, {"SABNZBD_TEMP": "", "DISK_FREE_MIN": "100G"}
+        healthy, sent = docker(container("sonarr"), container("radarr")), []
+        present = {"/tmp/sabnzbd-temp": (2, 5 * GB, 4096 * GB)}
+
+        def reader(path, timeout=None):
+            if path not in present:
+                raise OSError(2, "No such file or directory")
+            return present[path]
+        with mounted(reader), contextlib.redirect_stderr(io.StringIO()):
+            for minutes in (0, 15):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            present.clear()  # the tmpfs is gone; its free space is now unknown, not recovered
+            for hours in range(1, 6):
+                sent += self.check(state, healthy, hours * HOUR, cfg)
+        self.assertEqual([(m["title"], m["message"]) for m in sent], [
+            ("Media stack on h: 1 problem",
+             "• disk: dropped below 10G free for the downloads (now 5G free)"),
+            ("Media stack on h: 1 problem",
+             "• disk: can't read free space for the downloads path")])
+        self.assertTrue(state["tracked"]["disk:downloads"]["alerted"])
+
+    def test_moving_a_role_to_a_healthier_but_still_low_drive_goes_out_at_high(self):
+        """A documented tradeoff, not a defect, and tested so it stays a decision. MEDIA_ROOT moving
+        from a drive at 5G to one at 60G is genuinely news — it is a different filesystem, and the
+        floor deliberately does not follow the role onto it — but publish_stack reads any changed
+        description as a worsening, so better news arrives at High under a rotating_light, and its
+        sentence names a larger number than the one it replaces.
+
+        Left as it is on purpose. Ranking the two would mean comparing a level measured on one drive
+        against a level measured on another, which is the falsehood 2f3529a removed from the report
+        itself; re-introducing it to pick a priority buys a quieter tone with the same lie. The drive
+        really is under the threshold, and the bullet says what it actually has."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy, sent = docker(container("sonarr"), container("radarr")), []
+        drive = {"device": 1, "free": 5 * GB}
+
+        def reader(path, timeout=None):
+            if path != "/lib":
+                raise OSError(2, "No such file or directory")
+            return drive["device"], drive["free"], 4096 * GB
+        with mounted(reader), contextlib.redirect_stderr(io.StringIO()):
+            for minutes in (0, 15):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            drive.update(device=9, free=60 * GB)  # same role, a different and healthier drive
+            for minutes in (30, 45):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+        self.assertEqual([(m["message"], m["priority"], m["tags"]) for m in sent], [
+            ("• disk: dropped below 10G free for the library (now 5G free)",
+             sw.HIGH, ["rotating_light"]),
+            ("• disk: dropped below 100G free for the library (now 60G free)",
+             sw.HIGH, ["rotating_light"])])
+        self.assertEqual(state["disk"], {"disk:library": {"device": 9, "level": 100 * GB}})
+
+    def test_a_days_later_repeat_does_not_read_as_a_claim_about_the_present(self):
+        """The ratchet is what lets a sentence settle, and a settled sentence is what the daily
+        re-send re-sends. A day after the low point, "dropped below 10G" goes out word for word to an
+        artifex who has since freed 65G — "still not resolved" is true of the problem, and was the
+        first half of this fix, but the sentence above it still described the worst moment of
+        yesterday as though it were now."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy, sent = docker(container("sonarr"), container("radarr")), []
+        drive = Drive(5 * GB)
+        with mounted(drive):
+            for minutes in (0, 15):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            drive.free = 70 * GB  # 65G freed: still under DISK_FREE_MIN, so still a problem
+            for hours in range(1, 26):
+                sent += self.check(state, healthy, hours * HOUR, cfg)
+        self.assertEqual([m["message"] for m in sent], [
+            "• disk: dropped below 10G free for the library (now 5G free)",
+            "• disk: dropped below 10G free for the library (now 70G free)\n\n"
+            f"Still not resolved. First seen {sw.when(NOW)}."])
 
     def test_disk_check_is_off_by_the_setting(self):
         state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "off"}

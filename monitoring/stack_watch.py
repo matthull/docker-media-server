@@ -164,14 +164,24 @@ def parse_size(text: str) -> int:
     return int(float(match[1]) * SIZE_UNITS[match[2].upper()])
 
 
-def size(nbytes: float) -> str:
+def size(nbytes: float, precision: str = ".10g") -> str:
     """The largest whole unit, in parse_size's format, or plain bytes below a megabyte (which
     DISK_FREE_MIN's 1G floor and DISK_STEPS put out of reach, but which is not parse_size's format
-    and is not meant to be fed back to it)."""
+    and is not meant to be fed back to it).
+
+    The default keeps enough digits never to round a threshold or a step into a number the drive was
+    not actually under. `precision` is for the one figure here that is measured rather than derived:
+    free space arrives with every digit the filesystem has, and 142.5914421G is what that looks like
+    in a notification. MEASURED is that precision, and its 4 significant digits are also the most
+    that can render without an exponent, since a value large enough for 5 digits in one unit is
+    already past the next one."""
     for unit, scale in (("T", SIZE_UNITS["T"]), ("G", SIZE_UNITS["G"]), ("M", SIZE_UNITS["M"])):
         if nbytes >= scale:
-            return f"{nbytes / scale:.10g}{unit}"
+            return f"{nbytes / scale:{precision}}{unit}"
     return f"{int(nbytes)}B"
+
+
+MEASURED = ".4g"  # see size(): for free space, which is read off the filesystem, not computed
 
 
 def span(delta: timedelta) -> str:
@@ -616,7 +626,8 @@ def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT,
     return outcome["value"]
 
 
-def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dict[str, str]:
+def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None,
+                  free_now: dict | None = None) -> dict[str, str]:
     """One entry per filesystem behind DISK_ROLES with less than `minimum` free. Paths sharing a
     filesystem share an entry: on a single-drive host that is one alert, not one per role. A path
     that isn't configured isn't checked; one that can't be read is a problem in its own right, and
@@ -635,7 +646,13 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
     rather than the moment is what makes the text stable (see DISK_STEPS), and is why it says
     "dropped below": free space coming back up past a step doesn't make that untrue, so there is
     nothing to republish. Bytes, not the DISK_STEPS fraction, because retuning DISK_FREE_MIN
-    mid-problem would rescale a fraction into a level the drive was never actually under."""
+    mid-problem would rescale a fraction into a level the drive was never actually under.
+
+    `free_now`, when given, collects what each role's filesystem actually has free at this moment,
+    for the notification to quote beside the ratcheted sentence. It is a separate dict, and neither
+    part of `floors` nor of the description, on purpose: free space is the one quantity here that
+    varies continuously, and letting it into `entry["description"]` is exactly the flap DISK_STEPS'
+    ratchet exists to prevent. The notification quotes it; nothing ever compares it."""
     free_space = free_space or filesystem_free
     filesystems: dict[int, tuple[list[str], int]] = {}
     problems = {}
@@ -647,10 +664,18 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
         try:
             device, free, total = free_space(path)
         except OSError as exc:
-            if not configured:
+            if not configured and f"disk:{role}" not in floors:
                 # Compose's fallback, which it only creates on `up`. Not the user's claim about
                 # their disk, so an absent one is neither a problem nor worth a journal line every
                 # fifteen minutes for as long as the setting stays blank.
+                #
+                # Only while it isn't already a problem, though. A floor exists for exactly the
+                # roles that were a problem on the last run (run_check drops the rest), and once one
+                # is, the path going quiet is not recovery: skipping it here lets advance() decay the
+                # tracked problem into a genuine-looking all clear naming it as "Cleared", when all
+                # that is actually known is that the path stopped answering. A missed alert dressed
+                # as good news is the worst thing this check can do, so an unreadable path that was
+                # low stays a problem — an unreadable one — until it can be read again.
                 continue
             print(f"can't read free space for {setting}: {exc}", file=sys.stderr)
             problems[f"disk:{role}"] = f"disk: can't read free space for the {role} path"
@@ -662,6 +687,13 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
             # this whole check exists to deliver. Compose's fallback is usually /tmp, a tmpfs of a few
             # gigabytes against a threshold sized for the media library. A path the user configured is
             # their own claim about their disk and is left alone; this one the script inferred.
+            #
+            # Accepted residual, unlike the unreadable case above: dropping a fallback that IS
+            # already a problem does send a false "Cleared". Holding it instead would be the standing
+            # alert nobody can clear that this branch was written to remove, so the honest tradeoff
+            # is the other way round here. It takes a deliberate act to reach — raising DISK_FREE_MIN
+            # past the fallback's whole size, or moving the fallback onto a small filesystem — and
+            # the journal line below says what happened. See docs/stack-watch.md.
             print(f"not watching {setting}'s fallback: {size(total)} filesystem can't hold "
                   f"{size(minimum)} free", file=sys.stderr)
             continue
@@ -687,6 +719,13 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
         for key in keys:
             floors[key] = {"device": device, "level": level}
             problems[key] = description
+            # Every disk bullet carries the figure, not only the ones the ratchet has fallen behind
+            # on. A rule the reader can't see is worse than fifteen characters: told sometimes, he
+            # has no way to know whether a bullet without a figure means "still there" or "this
+            # build doesn't say", and the question the sentence raises — how much is there now? —
+            # is the same one every time.
+            if free_now is not None:
+                free_now[key] = free
     return problems
 
 
@@ -720,7 +759,8 @@ def migrate_disk_keys(state: dict) -> None:
                 floors[key] = {"level": level}  # no device: honoured once, then stamped
 
 
-def gather_problems(watch: Watch, floors: dict | None = None) -> dict[str, str]:
+def gather_problems(watch: Watch, floors: dict | None = None,
+                    free_now: dict | None = None) -> dict[str, str]:
     problems = stack_problems(Path(watch.cfg["STACK_DIR"]), watch.run)
     jellyfin_url = watch.cfg.get("JELLYFIN_URL") or "http://localhost:8096"
     if jellyfin_url.strip().lower() != "off":
@@ -729,7 +769,8 @@ def gather_problems(watch: Watch, floors: dict | None = None) -> dict[str, str]:
             problems["jellyfin"] = problem
     minimum = disk_minimum(watch.cfg)
     if minimum is not None:
-        problems |= disk_problems(watch.cfg, minimum, floors if floors is not None else {})
+        problems |= disk_problems(watch.cfg, minimum, floors if floors is not None else {},
+                                  free_now=free_now)
     return problems
 
 
@@ -758,28 +799,50 @@ def advance(tracked: dict, problems: dict[str, str], now: datetime, problem_age:
     return updated
 
 
+def cleared_lines(cleared) -> str:
+    """The "Cleared" block, or "" when nothing recovered.
+
+    Distinct sentences, not keys: two roles on one drive share one sentence, so listing per key
+    would name the same drive twice.
+
+    Nothing subtracts the problems still being reported, because a sentence cannot be in both lists.
+    Every description here names its own key's subject — "sonarr: …", or the roles sharing a drive —
+    and a disk sentence naming role R is only ever written in the same pass that puts disk:R in
+    `problems`, so a sentence still current always has its key still current. Worth keeping true:
+    "Cleared: x" printed above "• x" would be a flat contradiction."""
+    gone = sorted(set(cleared))
+    return "\n\nCleared:\n" + "\n".join(f"• {d}" for d in gone) if gone else ""
+
+
 def format_check(current: dict[str, str], host: str, worsened: bool, cleared: list[str] = (),
-                 repeat: bool = False, since: datetime | None = None) -> tuple[str, str, int]:
+                 repeat: bool = False, since: datetime | None = None,
+                 free_now: dict | None = None) -> tuple[str, str, int]:
     """`cleared` names what recovered, and `repeat` marks a re-send of something already reported.
 
     A repeat says "still not resolved" rather than "unchanged", because it can go out to someone who
     has just changed a great deal. The disk report ratchets to the low point of the episode, so an
     artifex who frees 60G to go from 10G to 70G is still under DISK_FREE_MIN, still has the problem,
-    and would read "unchanged" as a claim that his deletions did nothing.
+    and would read "unchanged" as a claim that his deletions did nothing. `free_now` is the other
+    half of that: a sentence the ratchet has held since the low point reads as a claim about now, so
+    each disk bullet quotes what the drive actually has, and that same 70G is stated rather than
+    left to be inferred from a sentence about 10G.
 
     Distinct descriptions, not keys: the disk check keys per role but words roles that share a
     filesystem as one sentence, and a single-drive host must read as one problem, not two identical
     ones. Naming what cleared is the only acknowledgement a recovery gets — the disk report ratchets,
     so freeing 60G to go from 10G to 70G changes nothing until DISK_FREE_MIN itself is cleared, and
-    "everything that was down is back up" never said what had been down."""
+    "everything that was down is back up" never said what had been down. That has to happen while
+    problems remain, too: a recovery announced only when the last one goes is a recovery the artifex
+    hears about on the system's schedule rather than his own."""
+    free_now = free_now or {}
     if not current:
-        message = "Everything that was down is back up."
-        if cleared:  # distinct, like `lines` below: two roles on one drive share one sentence
-            message += "\n\nCleared:\n" + "\n".join(f"• {d}" for d in sorted(set(cleared)))
-        return f"Media stack on {host}: all clear", message, LOW
-    lines = sorted(set(current.values()))
+        return (f"Media stack on {host}: all clear",
+                "Everything that was down is back up." + cleared_lines(cleared), LOW)
+    lines = sorted({description + (f" (now {size(free_now[key], MEASURED)} free)"
+                                   if key in free_now else "")
+                    for key, description in current.items()})
     title = f"Media stack on {host}: {len(lines)} problem{'s' if len(lines) != 1 else ''}"
-    message = "\n".join(f"• {line}" for line in lines)
+    message = "\n".join(f"• {line}" for line in lines) + cleared_lines(cleared)
     if repeat:
         message += "\n\nStill not resolved."
         if since is not None:
@@ -787,7 +850,7 @@ def format_check(current: dict[str, str], host: str, worsened: bool, cleared: li
     return title, message, HIGH if worsened else DEFAULT
 
 
-def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
+def publish_stack(watch: Watch, tracked: dict, stack: dict, free_now: dict | None = None) -> dict:
     """Brings the "<host>-stack" notification in line with the alerted problems and returns the new
     stack state. Returns `stack` unchanged when the update is held back or fails to send, so the next
     run tries again."""
@@ -829,7 +892,7 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     started = [parse_ts(entry.get("first")) for key, entry in tracked.items() if key in current]
     title, message, priority = format_check(
         current, watch.host, worsened, [d for k, d in shown.items() if k not in current],
-        unchanged, min([t for t in started if t], default=None))
+        unchanged, min([t for t in started if t], default=None), free_now)
     if len(sent) >= STACK_DAILY_CAP - 1:
         message += (f"\n\nThis has changed {STACK_DAILY_CAP} times in a day, so updates are muted "
                     f"until {when(sent[len(sent) - STACK_DAILY_CAP + 1] + day)}, except new problems.")
@@ -899,8 +962,12 @@ def run_check(watch: Watch, state: dict) -> None:
     migrate_disk_keys(state)
     previous = state.get("tracked", {})
     floors = state.setdefault("disk", {})
+    # Measured this run and thrown away with it. Nothing here is saved: a figure read last run is
+    # exactly the stale number this exists to replace, so an absent one has to mean "not measured
+    # now", not "here is the last one I had".
+    free_now: dict[str, int] = {}
     try:
-        problems = gather_problems(watch, floors)
+        problems = gather_problems(watch, floors, free_now)
     except Exception as exc:  # still reschedule the heartbeat, or a false "unreachable" goes out
         errors.append(exc)
     else:
@@ -928,7 +995,7 @@ def run_check(watch: Watch, state: dict) -> None:
         # it but a real all clear does. advance() has already applied the absence damping.
         state["disk"] = {key: level for key, level in floors.items() if key in tracked}
         try:
-            state["stack"] = publish_stack(watch, tracked, state["stack"])
+            state["stack"] = publish_stack(watch, tracked, state["stack"], free_now)
         except Exception as exc:
             errors.append(exc)
     try:
