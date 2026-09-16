@@ -66,6 +66,13 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "the check is inverted: on when off, off when on"),
     ("D14", 'if minimum < SIZE_UNITS["G"]:', 'if minimum < SIZE_UNITS["M"]:',
      "accepts a threshold of a few megabytes"),
+    # --- the Jellyfin check, whose error text is the one that quotes JELLYFIN_URL back
+    ("J1", 'return "jellyfin: not answering (details in the journal)"',
+     'return f"jellyfin: not answering ({brief(getattr(exc, \'reason\', exc))})"',
+     "leaks the OS/TLS error text, and with it the host JELLYFIN_URL names, to the public topic"),
+    ("J2", '        print(f"jellyfin health check failed: {exc}", file=sys.stderr)\n',
+     "",
+     "drops the real reason entirely, so the journal can't say why Jellyfin was unreachable"),
     # --- the ratchet, which is what keeps a wobbling drive from spending the day's alerts
     ("R1", "level = floors[key] = min(reached, floors.get(key, reached))",
      "level = floors[key] = max(reached, floors.get(key, reached))",

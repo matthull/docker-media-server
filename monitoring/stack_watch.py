@@ -523,8 +523,12 @@ def jellyfin_problem(url: str, http: Http) -> str | None:
         body = http("GET", url.rstrip("/") + "/health", {}, None, 10).strip()
     except urllib.error.HTTPError as exc:
         return f"jellyfin: health check returned HTTP {exc.code}"
-    except OSError as exc:  # URLError and timeouts; their reason is the OS's text, not the server's
-        return f"jellyfin: not answering ({brief(getattr(exc, 'reason', exc))})"
+    except OSError as exc:  # URLError and timeouts
+        # The reason is the OS's or OpenSSL's text and it quotes the URL back: a DNS failure names
+        # the host, a certificate failure names it again. JELLYFIN_URL is a LAN address today and a
+        # Tailscale name later, and the topic is public, so the reason goes to the journal only.
+        print(f"jellyfin health check failed: {exc}", file=sys.stderr)
+        return "jellyfin: not answering (details in the journal)"
     if body == "Healthy":
         return None
     if body in ("Degraded", "Unhealthy"):

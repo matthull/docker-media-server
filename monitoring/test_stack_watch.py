@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import re
+import socket
 import sys
 import tempfile
 import unittest
@@ -435,11 +436,31 @@ class JellyfinTest(unittest.TestCase):
         self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": "<html>SENTINEL_SECRET"})),
                          "jellyfin: unexpected answer from /health")
         refused = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
-        self.assertIn("not answering", sw.jellyfin_problem("http://jf", FakeHttp({"/health": refused})))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": refused})),
+                             "jellyfin: not answering (details in the journal)")
         http_error = urllib.error.HTTPError("http://jf/health", 503, "x", {}, None)
         self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": http_error})),
                          "jellyfin: health check returned HTTP 503")
 
+    def test_an_unanswered_check_never_carries_the_os_error_text(self):
+        """The URL is the one setting here that can name the host, and a failure to reach it is the
+        one error whose text quotes it back: DNS puts the hostname in the message, TLS puts it in the
+        certificate complaint. The topic is public, so neither can go out."""
+        unreachable = [
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known: SENTINEL_HOST")),
+            urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] hostname 'SENTINEL_HOST'"),
+            urllib.error.URLError(OSError(13, "SENTINEL_SECRET")),
+            TimeoutError(110, "timed out reaching SENTINEL_HOST"),
+        ]
+        for exc in unreachable:
+            with self.subTest(exc=exc):
+                with contextlib.redirect_stderr(io.StringIO()) as log:
+                    problem = sw.jellyfin_problem("http://SENTINEL_HOST:8096",
+                                                  FakeHttp({"/health": exc}))
+                self.assertEqual(problem, "jellyfin: not answering (details in the journal)")
+                self.assertNotIn("SENTINEL", problem)
+                self.assertIn("SENTINEL", log.getvalue())  # it went to the journal instead
 
 def free_space(*known):
     """A fake filesystem_free: (path, (device, bytes free)) pairs. Any other path is unreadable."""
