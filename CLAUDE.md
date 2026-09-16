@@ -107,8 +107,10 @@ Env vars are documented in `.env.example`. `COMPOSE_PROFILES=cloudflare` plus `C
 enables the tunnel; either alone does nothing.
 
 **Jellyfin is deliberately not in this stack** — it runs on the media host itself so it can use the
-GPU directly. From a container, reach it at its host's LAN address; see
-[docs/cloudflared.md](./docs/cloudflared.md) for why the obvious alternatives are wrong under WSL.
+GPU directly. From sonarr, radarr or seerr on a Linux host, reach it as `host.docker.internal` (their
+`host-gateway` entry). Under WSL, or from any other container, use the host's LAN address; see
+[docs/jellyfin-library-updates.md](./docs/jellyfin-library-updates.md#reaching-a-jellyfin-that-is-not-in-this-stack)
+and [docs/cloudflared.md](./docs/cloudflared.md) for why.
 Record the actual address in `CLAUDE.local.md`.
 
 ## Agent API Access
