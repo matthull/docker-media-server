@@ -259,12 +259,19 @@ Episode items exist and are listable via `/Items?ParentId=<library>&Recursive=tr
 `GET /Shows/{seriesId}/Seasons` and `GET /Shows/{seriesId}/Episodes` both return
 `TotalRecordCount: 0`, with or without `userId`. Those two endpoints are exactly what Seerr counts
 episodes with, so its full scan computes **zero** available episodes and **regresses** the media record
-from status 3 (processing) to status 1 (unknown) — worse than not scanning. A full library scan
-(`POST /Library/Refresh`) populates them within ~60 s, after which a Seerr rescan resolves the request
-immediately. Consequence: on a first TV import, Jellyfin needs a full scan *before* Seerr scans, and
-the scheduled 12 h Jellyfin scan vs Seerr's nightly full scan gives no ordering guarantee. When
-debugging "the episode is in Jellyfin but Seerr says Processing", check the `/Shows/...` endpoints —
-`/Items` will happily tell you everything is fine.
+from status 3 (processing) to status 1 (unknown) — worse than not scanning. **This is also
+user-visible in every Jellyfin client:** the web client's `itemDetails` page calls
+`getSeasons(seriesId)` → `/Shows/{id}/Seasons` to render the series detail page, so a stranded series
+shows poster art but no seasons or episodes to play. **Season packs are the common trigger** — all
+episodes import in one connector fire with no subsequent fire to heal the stale
+`SeriesPresentationUniqueKey`. Individual episode imports self-heal in 5–15 min because later
+connector fires update the children's keys. Since Sonarr prefers season packs, this is the common
+case. Worst-case resolution ≈36 h without intervention. Cheapest repair:
+`POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh`
+([jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293)). A full library scan
+(`POST /Library/Refresh`) also works but is heavier. When debugging "the episode is in Jellyfin but
+Seerr says Processing", check the `/Shows/...` endpoints — `/Items` will happily tell you everything
+is fine.
 
 **SABnzbd's temp-folder free space turning red does not mean the disk is low.** `glitter.main.js`
 colours it whenever the remaining queue exceeds free temp space (`mbleft/1024 > diskspace1`), which is

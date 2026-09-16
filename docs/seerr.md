@@ -39,7 +39,17 @@ Two independent upstream bugs cause this, and neither has a fix to wait for:
    `/Items` query lists the episodes with the correct `SeriesId`. The join is on
    `SeriesPresentationUniqueKey`, which is rewritten on the series after provider identification but
    left stale on children created before it
-   ([jellyfin#16097](https://github.com/jellyfin/jellyfin/issues/16097), open).
+   ([jellyfin#16097](https://github.com/jellyfin/jellyfin/issues/16097), open). **This is
+   user-visible in Jellyfin itself, not just Seerr** — the web client's `itemDetails` page renders
+   seasons from `/Shows/{id}/Seasons`, so a stranded series shows poster art but no seasons or
+   episodes to play (verified against Jellyfin 10.11.11 web client source). **Season packs are the
+   common trigger:** all episodes import at once in a single connector fire, so there is no subsequent
+   fire to heal the stale keys. Individual episode imports self-heal in 5–15 min because later
+   connector fires trigger series refreshes that update the children's keys. Sonarr prefers season
+   packs when available, so the stranding case is the common one — worst-case resolution ≈36 h
+   (Jellyfin's 12 h scan interleaved with Seerr's daily 03:00 cron). Cheapest known repair:
+   `POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh`
+   ([jellyfin#17293](https://github.com/jellyfin/jellyfin/issues/17293)).
 
 The Sonarr Scan sidesteps both: it derives availability from Sonarr's own
 `statistics.episodeFileCount` and never consults Jellyfin. It also completes the request itself — the
