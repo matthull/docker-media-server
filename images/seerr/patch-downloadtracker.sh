@@ -45,7 +45,7 @@ die() {
 
 [ -f "$target" ] || die "$target does not exist -- upstream layout changed"
 
-refresh_re='^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloads();[ 	]*$'
+refresh_re='^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloadz();[ 	]*$'
 queue_re='^[ 	]*const queueItems = await [A-Za-z0-9_$]*\.getQueue();[ 	]*$'
 
 before=$(grep -c 'refreshMonitoredDownloads' "$target" || true)
