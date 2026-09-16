@@ -50,6 +50,9 @@ monitoring/
   stack_watch.py                    # ntfy alerts for dead containers, host offline, stalled requests
   test_stack_watch.py               # python3 -m unittest discover -s monitoring
   install-stack-watch.sh            # systemd --user timers for the above; see docs/stack-watch.md
+images/
+  seerr/Dockerfile                  # The one built-not-pulled service; see its README.md
+  seerr/patch-downloadtracker.sh    # Drops the arr write that blocks Seerr's queue read
 scripts/
   jellyfin-refresh-series.sh        # Sonarr Custom Script: heals a stranded brand-new series
   install-jellyfin-refresh.sh       # Installs the above into sonarr + registers the connector
@@ -318,6 +321,14 @@ real protection.
 ## Image Pinning
 
 Images are pinned by tag + SHA256 digest, bumped by Renovate. Update both when changing one.
+
+**`seerr` is the one service that is built, not pulled.** Its pin lives in the `FROM` of
+`images/seerr/Dockerfile` instead of an `image:` key, and Renovate bumps it there the same way. The
+build deletes the redundant `RefreshMonitoredDownloads` write from Seerr's download tracker, which is
+what made download progress vanish during the very download being waited on. Do not "simplify" this
+back to `image:` — see `images/seerr/README.md` for the measurements and for why a bump cannot
+silently revert it. If a bump makes `docker compose up -d` fail in the patch script, that is the
+design working: read the new `downloadtracker.js` and update the `sed`, don't bypass it.
 
 `prowlarr` is deliberately on a `-nightly` tag — moving to stable is a **downgrade across a database
 migration**, which Prowlarr does not support and which needs a restore from

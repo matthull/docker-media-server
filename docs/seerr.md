@@ -164,15 +164,51 @@ is. Treat 45000 as a palliative that covers the common case, not as a fix.
 
 The upstream fix — stop issuing the write, poll for command completion with a deadline, and share one
 in-flight promise across concurrent syncs — is [PR #3473](https://github.com/seerr-team/seerr/pull/3473),
-closed as a duplicate of [PR #1055](https://github.com/seerr-team/seerr/pull/1055), which is still
-open. **v3.4.1 does not contain it.** Patching `dist/lib/downloadtracker.js` inside the container
-would sidestep the write entirely and is immune to contention, but an image bump silently reverts it
-and download progress breaks again with every container reporting healthy — do not go that way
-without something that asserts the patch is still there.
+closed as a duplicate of [PR #1055](https://github.com/seerr-team/seerr/pull/1055), which is a
+one-line `pageSize` change that does not touch this code path. **Nothing is landing upstream.**
 
-**This is a Seerr setting, not Compose config — it does not travel with this repo**, exactly like the
-Sonarr Scan schedule above. It is the *second* setting living only in the jellyseerr config volume;
-check both after any migration or restore.
+### The fix: Seerr is built here, not pulled
+
+`images/seerr/Dockerfile` builds Seerr from the pinned upstream digest and deletes the two
+`await <arr>.refreshMonitoredDownloads();` lines from `dist/lib/downloadtracker.js`. Nothing else
+changes; the read is untouched.
+
+The obvious objection to patching inside an image is that a Renovate bump reverts it silently, with
+every container still reporting healthy. Three things make that impossible here, and
+[`images/seerr/README.md`](../images/seerr/README.md) is the full account:
+
+- the patch is in git, so it travels with the repo;
+- the patch script asserts the call sites before and after editing and **fails the build** if it
+  cannot patch, so no unpatched image is ever produced — the last good one keeps serving;
+- `pull_policy: build` makes `docker compose up -d` rebuild from the pinned base, so a bump actually
+  reaches the container instead of sitting unused.
+
+Dropping the write is safe because **both arrs already run `RefreshMonitoredDownloads` themselves
+every 1 minute** (`GET /api/v3/system/task`), the same cadence as Seerr's own Download Sync job.
+
+Measured before and after on the same host, minutes apart, with
+`local/seerr-timeout/cycletest.py 50` holding both arr write locks across a Download Sync boundary:
+
+| | contended cycles clean |
+| --- | --- |
+| v3.4.1 as shipped, `apiRequestTimeout` 45000 | **0 / 2** (Sonarr 30.1 s → 500, Radarr 45.02 s → timeout) |
+| built from `images/seerr/` | **3 / 3** |
+
+Confirmed at the protocol level too: the arrs' command history shows Seerr's `trigger=manual`
+`RefreshMonitoredDownloads` stopping at the exact cycle the patched container started, with only
+`trigger=scheduled` after it.
+
+**Still unobserved:** nobody has yet watched a progress bar render in Seerr for a real in-flight
+download. Errors disappearing is not the same as progress appearing, and that link is inferred.
+
+**Keep `apiRequestTimeout` at 45000 anyway.** It no longer protects the download tracker, but it
+covers every *other* Seerr→arr call that takes the write lock — notably adding a newly approved
+request to Sonarr or Radarr, which contends with exactly the same imports.
+
+**That setting is Seerr config, not Compose config — it does not travel with this repo**, exactly like
+the Sonarr Scan schedule above. It is the *second* setting living only in the jellyseerr config
+volume; check both after any migration or restore. The download-tracker patch itself is no longer in
+that category — it is in git now.
 
 ## Things to Know
 
