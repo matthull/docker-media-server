@@ -97,6 +97,29 @@ The build guards were proven to fail, not just to pass:
 | Base with the calls moved behind `this.`        | build failed: `2 reference(s) survived the patch`            |
 | Real base                                       | build succeeded; diff is exactly the two deleted lines       |
 
+## What is not established
+
+- **No browser observation.** The tracker was seen reading a real non-empty queue, and
+  `GET /api/v1/request` returned the populated `media.downloadStatus` a request card renders from
+  (release name, `status=downloading`, size, `timeLeft`, ETA), for a real download that then went
+  through to Available. Nobody has watched the bar itself, and the one sample was caught at ~100%,
+  so a *changing* percentage is still unobserved.
+- **Two unexplained observations, both probably measurement contamination.** In an 18-minute window
+  after the change, one cycle failed with all four errors landing inside 60 ms on both arrs after a
+  2.5-minute gap in which no scheduled job fired at all; and one Download Sync took 25 s to log its
+  queue result, on a read measured elsewhere at ≤9 ms. The Docker daemon on the host was visibly
+  stalled across that window (an unrelated `compose up -d` hung ~5 minutes on an `alpine` container
+  running `sleep`) while image builds ran concurrently, which fits a starved Node event loop far
+  better than anything in this code path. **It was not reproduced and host load was not sampled.**
+  If either recurs on an idle host, it is a real defect unrelated to the removed write — and the
+  25 s figure would contradict "`GET /queue` never blocks", which is worth chasing on its own.
+
+## Rolling this back
+
+`git revert` the commit that added this directory, then `docker compose up -d seerr`. That restores
+the upstream `image:` pin; the only thing that returns with it is the blocking write, so expect
+`Unable to get queue` errors to reappear during downloads.
+
 ## When a bump breaks the build
 
 That is the design working. Read the new `downloadtracker.js`, confirm the call sites still exist in
