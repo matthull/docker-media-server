@@ -103,6 +103,57 @@ list is then never reached* and those titles silently stop resolving — a failu
 success, because the front of the library keeps working. TMDB is not a constraint: lookups are cached
 6-12h, so cadence and API volume are decoupled.
 
+## "Unable to get queue from Radarr/Sonarr server" — raise `apiRequestTimeout` to 45000
+
+The Download Tracker logs `Unable to get queue from Radarr server: Radarr` (and the Sonarr twin) on
+its one-minute cycle, and the requester sees no download progress at all — just "Processing" until
+the title appears. Set **Settings > Networking > API request timeout to 45000** (`network.apiRequestTimeout`
+in `config/jellyseerr/settings.json`) and restart the container.
+
+**Why it happens.** The tracker calls `refreshMonitoredDownloads()` — `POST /api/v3/command`, a
+database **write** — before `getQueue()` on every cycle. When an arr's own work (imports, searches,
+RSS sync) holds the SQLite write lock, that POST blocks until the lock frees. Both arrs are already
+`journal_mode=wal`, so this is not a mode you can tune away; reads are unaffected, and a `GET /queue`
+measured **3-5 ms while a write lock was held**. Only the write blocks. Measured by holding the lock
+with `BEGIN IMMEDIATE` and timing the POST:
+
+| Write lock held | Sonarr `POST /command` | Radarr `POST /command` |
+| --------------- | ---------------------- | ---------------------- |
+| 6 s             | 5.71 s → 201           | 5.79 s → 201           |
+| 20 s            | 19.74 s → 201          | 19.75 s → 201          |
+| 35 s            | **30.08 s → 500**      | 34.74 s → 201          |
+| 45 s            | **30.07 s → 500**      | 44.76 s → 201          |
+| 60 s            | **30.10 s → 500**      | 59.73 s → 201          |
+
+Response time tracks the lock hold almost exactly — so a bigger timeout really does convert these
+into successes, up to a point.
+
+**Use 45000, not 30000.** Sonarr (4.0.19) has a hard server-side ceiling: past ~30 s it gives up and
+returns **HTTP 500 at 30.07-30.10 s**, reproducible across three trials. Setting the timeout to
+30000 makes Seerr's client deadline race that ceiling by ~75 ms — Seerr aborts first and logs a
+*timeout*, hiding the real HTTP 500 behind what looks like a network fault. It also throws away the
+30-45 s band on Radarr, which has no such ceiling and returns 201 there. 45000 keeps every success
+30000 would get, adds Radarr's 30-45 s band, and lets Sonarr's 500 arrive as itself.
+
+**Residual — this does not fix everything, and cannot.** Sonarr's 30 s ceiling is Sonarr's, and no
+Seerr-side setting reaches it: contention longer than ~30 s still fails. Under *real* multi-writer
+contention an arr can also exhaust its Polly retries and 500 much sooner (one observed at 11 s after
+the cycle start). A longer timeout is useless against a 500. Verified both directions: three
+consecutive cycles under a deliberate 20 s lock conflict stayed clean, while a 50 s conflict still
+failed — Sonarr at 30.13 s (its ceiling) and Radarr at 45.02 s (Seerr's timeout).
+
+The upstream fix — stop issuing the write, poll for command completion with a deadline, and share one
+in-flight promise across concurrent syncs — is [PR #3473](https://github.com/seerr-team/seerr/pull/3473),
+closed as a duplicate of [PR #1055](https://github.com/seerr-team/seerr/pull/1055), which is still
+open. **v3.4.1 does not contain it.** Patching `dist/lib/downloadtracker.js` inside the container
+would sidestep the write entirely and is immune to contention, but an image bump silently reverts it
+and download progress breaks again with every container reporting healthy — do not go that way
+without something that asserts the patch is still there.
+
+**This is a Seerr setting, not Compose config — it does not travel with this repo**, exactly like the
+Sonarr Scan schedule above. It is the *second* setting living only in the jellyseerr config volume;
+check both after any migration or restore.
+
 ## Things to Know
 
 - **Behind a reverse proxy or tunnel, set two things** — Settings > General > *Enable Proxy Support*

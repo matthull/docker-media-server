@@ -205,6 +205,19 @@ in both projects and unaffected by Jellyfin version — do not go looking for an
 reasoning, the brand-new-series hierarchy bug it also sidesteps, and the library-size ceiling are in
 [docs/seerr.md](./docs/seerr.md).
 
+**Seerr's `apiRequestTimeout` must be 45000, and 30000 is the one wrong answer.** The Download
+Tracker POSTs `RefreshMonitoredDownloads` — a database *write* — to both arrs every minute before
+reading the queue, so it blocks whenever an arr's own work holds the SQLite write lock, and the
+requester sees no download progress. Response time tracks the lock hold almost exactly, so a larger
+timeout genuinely converts these into successes — but **Sonarr 4.0.19 gives up at a hard ceiling and
+returns HTTP 500 at 30.07-30.10s** (three trials), so a 30000 client deadline races that ceiling by
+~75ms: Seerr aborts first and logs a *timeout*, disguising a real 500 as a network fault, and throws
+away the 30-45s band on Radarr, which has no ceiling. Both arrs are already `journal_mode=wal` — not
+tunable that way — and `GET /queue` measures 3-5ms *while the write lock is held*, so only the write
+is affected. Contention past ~30s still fails and no Seerr-side setting can reach it. Measurements,
+the residual, and why patching `downloadtracker.js` in the container is a trap are in
+[docs/seerr.md](./docs/seerr.md).
+
 **Bazarr provider reality (1.6.0):** `podnapisi` was removed upstream and is silently dropped from
 `enabled_providers` on restart; `subsource` needs an API key and throttles with `ConfigurationError`
 without one; `subf2m` needs a `user_agent` or fails identically, forever. Enabled and healthy here:
