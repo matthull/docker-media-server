@@ -28,12 +28,16 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+# Imported as a name, not as http.client: `http` is a parameter name throughout this file (the
+# injected request function), so the module would be shadowed exactly where it is needed.
+from http.client import HTTPException
 from pathlib import Path
 from typing import Callable
 
@@ -65,6 +69,20 @@ FAILURE_REPEAT = timedelta(days=1)  # "Stack watch is failing" is re-sent this o
 # version pruned at a flat day, which made every value above a day behave identically.
 STACK_REPEAT = timedelta(days=1)
 MAX_DELAY = timedelta(days=3)  # ntfy.sh's message-delay-limit
+# Scheduling right at MAX_DELAY leaves no room for the clock difference between this host and
+# ntfy.sh, and the delay is rejected outright rather than shortened: the publish 400s, the heartbeat
+# is never rescheduled, and the dead man's switch the setting was raised to lengthen is the thing
+# that breaks. Held back by a whole hour rather than a token minute so that the largest grace
+# parse_grace will take is a round number, which is what the error message has to quote.
+DELAY_MARGIN = timedelta(hours=1)
+# ntfy.sh ignores a cancel that reaches it in the same second as the publish it cancels — measured
+# against the service, and the reason docs/stack-watch.md tells a tester to wait before cancelling.
+# `disarm` sits in exactly that window on two real paths: the installer cancelling a heartbeat the
+# check it just ran had scheduled, and `--uninstall` landing seconds after a timer tick. Unhandled,
+# the switch stays armed and an "unreachable" alert goes out about a host that was shut down on
+# purpose — the one false alarm this check can produce that nobody can act on.
+CANCEL_SETTLE = timedelta(seconds=5)
+CANCEL_ATTEMPTS = 3  # each confirmed against the server, so this is a ceiling and not a cost
 STALL_REMINDERS = 2  # reminders about a stalled title after the digest that first listed it
 MAX_EPISODES_LISTED = 4  # a series missing more episodes than this is shown as a count
 MAX_MESSAGE_BYTES = 4096  # ntfy delivers anything longer as an attachment
@@ -296,6 +314,45 @@ class Notifier:
         topic = urllib.parse.quote(self.topic, safe="")
         self.http("DELETE", f"{self.server.rstrip('/')}/{topic}/{sequence_id}", {}, None)
 
+    def feed(self, query: str) -> list[dict] | None:
+        """One poll of the topic, or None when the server can't be read."""
+        topic = urllib.parse.quote(self.topic, safe="")
+        try:
+            body = self.http("GET", f"{self.server.rstrip('/')}/{topic}/json?{query}", {}, None)
+            return [event for event in (json.loads(line) for line in body.splitlines() if line.strip())
+                    if isinstance(event, dict)]
+        except (OSError, ValueError, HTTPException) as exc:
+            # describe_failure, not the error: a URLError quotes the URL back, and the URL is the
+            # topic. Anyone who knows the topic can read and cancel on it.
+            print(f"can't read the topic: {describe_failure(exc)}", file=sys.stderr)
+            return None
+
+    def pending(self, sequence_id: str) -> bool | None:
+        """Whether a message for this sequence is still waiting to be delivered, or None when the
+        server can't say.
+
+        A cancel ntfy accepted and one it ignored both answer 200, so the only way to tell them
+        apart is to ask what is still scheduled. The trap is that `scheduled=1` does not mean "only
+        the scheduled ones": measured against ntfy.sh, the plain poll returns the topic's delivered
+        history and `scheduled=1` *adds* the ones still waiting. Asking the single question and
+        matching on the sequence therefore matches every heartbeat this host ever delivered, and
+        reports an alert as armed forever — which is what the first live run of this code did, on a
+        cancel that had in fact worked on its first attempt.
+
+        So the answer is the difference between the two feeds, by message id: what `scheduled=1`
+        knows about and the delivered history does not is exactly what has yet to go out. Ids, not
+        timestamps, so nothing here depends on this host's clock agreeing with ntfy's."""
+        delivered = self.feed("poll=1&since=all")
+        waiting = self.feed("poll=1&scheduled=1&since=all")
+        if delivered is None or waiting is None:
+            return None
+
+        def messages(events):
+            return {event.get("id") for event in events
+                    if event.get("sequence_id") == sequence_id and event.get("event") == "message"}
+
+        return bool(messages(waiting) - messages(delivered))
+
 
 @dataclass
 class Watch:
@@ -349,7 +406,9 @@ class Arr:
                                         {"X-Api-Key": self.key}))
         except urllib.error.HTTPError as exc:
             raise WatchError(f"{self.name}: HTTP {exc.code}") from exc
-        except (OSError, ValueError) as exc:  # URLError and timeouts; a body that isn't JSON
+        except (OSError, ValueError, HTTPException) as exc:
+            # URLError and timeouts; a body that isn't JSON; a reply cut short by an arr that is
+            # restarting, which is an HTTPException and so is none of the other two.
             raise WatchError(f"{self.name}: no usable answer from its API") from exc
 
     def all_records(self, path: str, **params) -> list:
@@ -471,17 +530,33 @@ def fit_lines(lines: list[str], footer: str) -> str:
     return "\n".join(lines[:shown] + ([f"… and {hidden} more"] if hidden else [])) + footer
 
 
+def arr_is_off(cfg: dict, name: str) -> bool:
+    """Whether this arr is switched off, the same way JELLYFIN_URL=off switches Jellyfin off.
+
+    Without an off switch a stack that doesn't run one of the arrs — a fork with no Sonarr, or one
+    of them stopped for a while — gets a daily "Stack watch is failing: <name>: can't read its
+    config.xml", with nothing the artifex can set to stop it short of turning the whole digest off.
+    The missing file is a real error for a service that is supposed to be there, so the setting is
+    what distinguishes the two; the script cannot tell them apart on its own."""
+    return (cfg.get(f"{name.upper()}_URL") or "").strip().lower() == "off"
+
+
 def run_stalled(watch: Watch, state: dict) -> None:
     cfg, now = watch.cfg, watch.now
     stall_days = float(cfg.get("STALL_DAYS") or 3)
     remind_days = float(cfg.get("STALL_REMIND_DAYS") or 7)
-    radarr = Arr.from_config(cfg, "radarr", watch.http)
-    queued = {r.get("movieId") for r in radarr.all_records("queue")}
-    items = stalled_movies(radarr.all_records("wanted/missing", monitored=True), queued, now, stall_days)
-    sonarr = Arr.from_config(cfg, "sonarr", watch.http)
-    queued = {r.get("episodeId") for r in sonarr.all_records("queue")}
-    items += stalled_episodes(sonarr.all_records("wanted/missing", monitored=True, includeSeries=True),
-                              queued, now, stall_days)
+    items: list[Stalled] = []
+    if not arr_is_off(cfg, "radarr"):
+        radarr = Arr.from_config(cfg, "radarr", watch.http)
+        queued = {r.get("movieId") for r in radarr.all_records("queue")}
+        items += stalled_movies(radarr.all_records("wanted/missing", monitored=True), queued, now,
+                                stall_days)
+    if not arr_is_off(cfg, "sonarr"):
+        sonarr = Arr.from_config(cfg, "sonarr", watch.http)
+        queued = {r.get("episodeId") for r in sonarr.all_records("queue")}
+        items += stalled_episodes(
+            sonarr.all_records("wanted/missing", monitored=True, includeSeries=True), queued, now,
+            stall_days)
 
     # Before bd9252e an entry was just the time it was first sent.
     notified = {key: {"at": entry, "sent": 1} if isinstance(entry, str) else entry
@@ -554,7 +629,12 @@ def jellyfin_problem(url: str, http: Http) -> str | None:
         body = http("GET", url.rstrip("/") + "/health", {}, None, 10).strip()
     except urllib.error.HTTPError as exc:
         return f"jellyfin: health check returned HTTP {exc.code}"
-    except OSError as exc:  # URLError and timeouts
+    except (OSError, HTTPException) as exc:  # URLError and timeouts; a truncated reply
+        # http.client.HTTPException is not an OSError, and a Jellyfin that is restarting is exactly
+        # what produces one: IncompleteRead or BadStatusLine from a connection dropped mid-reply.
+        # Uncaught it leaves this function, ends the whole run, and after CONSECUTIVE_RUNS reports
+        # "Stack watch is failing: IncompleteRead" — the watch blaming itself, and taking the
+        # container and disk checks down with it, for the ordinary case it exists to report.
         # The reason is the OS's or OpenSSL's text and it quotes the URL back: a DNS failure names
         # the host, a certificate failure names it again. JELLYFIN_URL is a LAN address today and a
         # Tailscale name later, and the topic is public, so the reason goes to the journal only.
@@ -906,7 +986,8 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict, free_now: dict | Non
 
 
 def parse_grace(text: str, timing: Timing) -> timedelta:
-    longest = MAX_DELAY - timing.heartbeat_step  # the alert is scheduled a step past grace
+    # The alert is scheduled a step past grace, and DELAY_MARGIN keeps that off ntfy's hard limit.
+    longest = MAX_DELAY - timing.heartbeat_step - DELAY_MARGIN
     try:
         grace = timedelta(seconds=parse_duration(text))
     except ValueError:
@@ -937,10 +1018,18 @@ def heartbeat(watch: Watch, state: dict) -> None:
         # lowering the grace in the same edit can't make a delivered alert out of one that wasn't.
         beat["due"] = (parse_ts(beat.pop("armed")) + max(grace, timedelta(hours=24))).isoformat()
     due, last = parse_ts(beat.get("due")), parse_ts(beat.get("last"))
-    if due is not None and now > due:
+    if due is not None and now > due - CANCEL_SETTLE:
+        # A run landing within CANCEL_SETTLE of `due` cannot know which way the race went: ntfy's
+        # sender may already have released the message, or may be about to. Both branches below
+        # publish on this sequence, and a publish replaces a message still waiting, so treating the
+        # window as "not yet due" would let the reschedule quietly swallow an alert the artifex may
+        # already be holding — an "unreachable" with no all clear ever coming, which is the one
+        # outcome here nobody can act on. It is claimed as a recovery instead, and the sentence
+        # stops short of asserting a delivery that is genuinely unknown.
+        went_out = (f"The unreachable alert went out {when(due)}." if now > due else
+                    f"The unreachable alert was due {when(due)} and may already have gone out.")
         notifier.send(f"{watch.host} is back online",
-                      f"Out of contact from {when(last or due - grace)} to {when(now)}. "
-                      f"The unreachable alert went out {when(due)}.",
+                      f"Out of contact from {when(last or due - grace)} to {when(now)}. {went_out}",
                       priority=DEFAULT, tags=("white_check_mark",), sequence_id=sequence_id)
         del beat["due"]  # announced, so not again even if rescheduling below fails
         due = None
@@ -955,6 +1044,10 @@ def heartbeat(watch: Watch, state: dict) -> None:
             "can't be reached until it's back.",
             priority=HIGH, tags=("warning",), sequence_id=sequence_id, delay_until=now + grace + step)
         beat["due"] = (now + grace + step).isoformat()
+        # When, not whether: `disarm` needs this to know if it is inside the second in which ntfy
+        # ignores a cancel. Written only after the publish returns, so it dates a message that
+        # really is on the server.
+        beat["published"] = now.isoformat()
 
 
 def run_check(watch: Watch, state: dict) -> None:
@@ -1045,8 +1138,73 @@ def record_success(watch: Watch, command: str, state: dict) -> None:
         state["failure"] = {"alerted": failure["alerted"]}  # say so next time
 
 
+def run_disarm(watch: Watch, state_path: Path, dry_run: bool = False, sleep=time.sleep) -> int:
+    """Cancels the dead man's switch and confirms the server really dropped it.
+
+    ntfy answers 200 to a cancel it ignores and to one it accepts alike, so the old single DELETE
+    could not tell "cancelled" from "still armed" — and it is ignored when it arrives in the same
+    second as the publish, which is precisely when the two callers that matter run it: the
+    installer cancelling the heartbeat a failed first install had just scheduled, and --uninstall
+    landing just after a timer tick. What was left armed then fires hours later, telling the artifex
+    a host he deliberately shut down is unreachable.
+
+    So: wait out the rest of that second when the state file says one was just published, cancel,
+    then ask what is still scheduled and cancel again if it is. The wait is only an optimisation —
+    it saves a doomed attempt — and the confirmation is what actually decides, which is what keeps
+    this correct when `published` is absent, stale or wrong.
+
+    Exit code 1 means the alert is known to be still armed, or the cancel itself could not be sent;
+    a cancel that went out but could not be confirmed is reported and treated as success, because it
+    almost certainly worked and the caller's alternative is to fail a clean uninstall."""
+    sequence_id = watch.sequence("heartbeat")
+    if dry_run:
+        watch.notifier.delete(sequence_id)
+        return 0
+    # Read-only, and never fatal: an unreadable state file only costs the wait below its head start.
+    # The cancel has to go out even then — losing state is a reason to disarm, not a reason not to.
+    state: dict = {}
+    try:
+        state, _ = load_state(state_path, watch.now, dry_run=True)
+    except OSError as exc:
+        print(f"can't read {state_path}, so the cancel can't be timed: {exc}", file=sys.stderr)
+    beat = state.get("heartbeat")
+    published = beat.get("published") if isinstance(beat, dict) else None
+    settle = CANCEL_SETTLE.total_seconds()
+    if isinstance(published, str):
+        # Only the part of the blind spot that is left: one published an hour ago needs no wait.
+        pause = settle - (watch.now - parse_ts(published)).total_seconds()
+        if 0 < pause <= settle:
+            sleep(pause)
+    armed = None
+    for attempt in range(CANCEL_ATTEMPTS):
+        if attempt:
+            sleep(settle)
+        try:
+            watch.notifier.delete(sequence_id)
+        except Exception as exc:
+            print(f"can't cancel the scheduled alert: {describe_failure(exc)}", file=sys.stderr)
+            return 1
+        armed = watch.notifier.pending(sequence_id)
+        if armed is not True:
+            break
+    if armed:
+        print(f"the scheduled alert is still armed after {CANCEL_ATTEMPTS} attempts: it will go out "
+              "when its delay expires. Cancel it by hand, or ignore the alert when it arrives.",
+              file=sys.stderr)
+        return 1
+    if armed is None:
+        print("cancelled, but ntfy could not confirm it (details above)", file=sys.stderr)
+    try:
+        if state.pop("heartbeat", None) is not None:
+            save_json(state_path, state)
+    except OSError as exc:
+        print(f"Cancelled, but can't update {state_path}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None, environ=None, http: Http = http_request, run: Run = run_cmd,
-         now: datetime | None = None) -> int:
+         now: datetime | None = None, sleep=time.sleep) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=["check", "stalled", "disarm"])
     parser.add_argument("--test", action="store_true",
@@ -1074,18 +1232,7 @@ def main(argv=None, environ=None, http: Http = http_request, run: Run = run_cmd,
     state_path = Path(cfg.get("STATE_DIR") or state_home / "media-stack-watch") / f"{state_name}{suffix}.json"
 
     if args.command == "disarm":
-        # Cancel first, so that a full or broken disk can't leave the alert scheduled.
-        notifier.delete(watch.sequence("heartbeat"))
-        if args.dry_run:
-            return 0
-        try:
-            state, _ = load_state(state_path, watch.now, dry_run=True)
-            if state.pop("heartbeat", None) is not None:
-                save_json(state_path, state)
-        except OSError as exc:
-            print(f"Cancelled, but can't update {state_path}: {exc}", file=sys.stderr)
-            return 1
-        return 0
+        return run_disarm(watch, state_path, args.dry_run, sleep)
 
     try:
         state, moved_to = load_state(state_path, watch.now, args.dry_run)
@@ -1121,7 +1268,22 @@ def main(argv=None, environ=None, http: Http = http_request, run: Run = run_cmd,
         record_success(watch, args.command, state)
         code = 0
     if not args.dry_run:
-        save_json(state_path, state)
+        try:
+            save_json(state_path, state)
+        except OSError as exc:
+            # The probe above proved the file could be written before anything was sent, so getting
+            # here means the disk filled during the run. Everything this run decided is lost: the
+            # alerts it just sent are not recorded as shown, the heartbeat's new `due` is not
+            # recorded as scheduled, and the failure counter that would eventually say so cannot be
+            # incremented either. The next run starts from the same state and sends the same things
+            # again, held down only by STACK_DAILY_CAP, which is a cap and not a fix.
+            #
+            # Nothing is notified from here on purpose: a notification would be the one thing that
+            # does repeat every run, since suppressing it needs the state that cannot be written.
+            # The journal and a non-zero exit — which systemd records — are what is left.
+            print(f"Can't save {state_path}, so this run's alerts and heartbeat are not recorded "
+                  f"and may repeat: {exc}", file=sys.stderr)
+            return 1
     return code
 
 

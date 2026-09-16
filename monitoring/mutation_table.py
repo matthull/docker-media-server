@@ -247,6 +247,75 @@ MUTANTS: list[tuple[str, str, str, str]] = [
            "        current[key] != shown[key] for key in current.keys() & shown.keys())",
      "    worsened = bool(current.keys() - shown.keys())",
      "a worsening step goes out at Default with a white_check_mark"),
+    # --- cancelling the dead man's switch, where ntfy answers 200 to a cancel it ignored
+    ("X1", "        armed = watch.notifier.pending(sequence_id)\n        if armed is not True:\n"
+           "            break",
+     "        armed = watch.notifier.pending(sequence_id)\n        break",
+     "one cancel is assumed to have worked, which is the bug: ntfy answers 200 either way"),
+    # No X2: dropping `event == "message"` from pending()'s filter is an equivalent mutant, not a
+    # gap. A cancel's marker was measured to appear in BOTH feeds, so it is in `waiting` and in
+    # `delivered` alike and subtracts out of the difference whatever the filter says. The filter is
+    # kept for what it says about intent, and because it is the only thing that would still hold if
+    # ntfy ever returned a marker in one feed and not the other — behaviour never observed here, and
+    # not worth a test written to match a guess about a server.
+    ("X3", '                    if event.get("sequence_id") == sequence_id and event.get("event") == "message"}',
+     '                    if event.get("event") == "message"}',
+     "another host's scheduled alert on the same topic reads as this one's"),
+    ("X13", "        return bool(messages(waiting) - messages(delivered))",
+     "        return bool(messages(waiting))",
+     "every heartbeat the host ever delivered reads as still armed, so no cancel is ever believed"),
+    ("X14", '        waiting = self.feed("poll=1&scheduled=1&since=all")',
+     '        waiting = self.feed("poll=1&since=all")',
+     "the feed that knows about waiting messages is never asked, so nothing is ever armed"),
+    ("X4", "        if 0 < pause <= settle:\n            sleep(pause)", "        if False:\n"
+           "            sleep(pause)",
+     "the cancel goes out inside the second ntfy ignores, wasting the first attempt"),
+    ("X5", "    if armed:\n", "    if False:\n",
+     "an alert that is still armed after every attempt is reported as a clean disarm"),
+    ("X6", "    if armed is None:\n", "    if False:\n",
+     "a cancel ntfy could not confirm is reported as confirmed"),
+    ("X7", "    if dry_run:\n        watch.notifier.delete(sequence_id)\n        return 0",
+     "    if False:\n        watch.notifier.delete(sequence_id)\n        return 0",
+     "--dry-run polls the real topic and waits"),
+    ("X8", "        beat[\"published\"] = now.isoformat()", "        pass",
+     "disarm can't tell a heartbeat published a second ago from one published an hour ago"),
+    # --- the window in which nobody can say whether ntfy already released the message
+    ("X9", "    if due is not None and now > due - CANCEL_SETTLE:",
+     "    if due is not None and now > due:",
+     "a run racing ntfy's sender strands an unreachable alert with no all clear ever coming"),
+    ("X10", 'went_out = (f"The unreachable alert went out {when(due)}." if now > due else',
+     'went_out = (f"The unreachable alert went out {when(due)}." if True else',
+     "a recovery asserts a delivery that may not have happened"),
+    ("X11", "CANCEL_SETTLE = timedelta(seconds=5)", "CANCEL_SETTLE = timedelta(seconds=0)",
+     "the blind spot is treated as instantaneous, so neither the wait nor the race window exists"),
+    ("X12", "CANCEL_ATTEMPTS = 3", "CANCEL_ATTEMPTS = 1", "a cancel ntfy ignored is never retried"),
+    # --- scheduling that has to stay inside ntfy's delay limit
+    ("GR1", "    longest = MAX_DELAY - timing.heartbeat_step - DELAY_MARGIN",
+     "    longest = MAX_DELAY - timing.heartbeat_step",
+     "the longest grace schedules exactly at ntfy's limit, where clock skew 400s the publish"),
+    # --- a disk that fills after the probe proved the state file writable
+    ("SV1", "        try:\n            save_json(state_path, state)\n        except OSError as exc:",
+     "        try:\n            save_json(state_path, state)\n        except ZeroDivisionError as exc:",
+     "a disk filling mid-run leaves through an uncaught OSError with nothing naming the state file"),
+    ("SV2", '                  f"and may repeat: {exc}", file=sys.stderr)\n            return 1',
+     '                  f"and may repeat: {exc}", file=sys.stderr)\n            return code',
+     "systemd is told the run succeeded although nothing it decided was recorded"),
+    # --- a reply cut short, which is not an OSError
+    ("H1", "    except (OSError, HTTPException) as exc:  # URLError and timeouts; a truncated reply",
+     "    except OSError as exc:  # URLError and timeouts; a truncated reply",
+     "a restarting Jellyfin is reported as the watch itself failing, and takes the run down"),
+    ("H2", "        except (OSError, ValueError, HTTPException) as exc:",
+     "        except (OSError, ValueError) as exc:",
+     "a restarting arr is reported as the watch itself failing"),
+    # --- an arr that isn't part of this stack
+    ("A1", 'return (cfg.get(f"{name.upper()}_URL") or "").strip().lower() == "off"',
+     "return False",
+     "a stack without one of the arrs gets a daily failure with no way to switch it off"),
+    ("A2", 'return (cfg.get(f"{name.upper()}_URL") or "").strip().lower() == "off"',
+     'return (cfg.get(f"{name.upper()}_URL") or "").strip() == "off"',
+     '"OFF" and "Off" stop meaning off, unlike every other setting here'),
+    ("A3", 'return (cfg.get(f"{name.upper()}_URL") or "").strip().lower() == "off"',
+     "return True", "the digest silently checks nothing and reports no stalled titles, ever"),
 ]
 
 

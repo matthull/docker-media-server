@@ -139,10 +139,24 @@ A changed `HEARTBEAT_GRACE` takes effect on the next check, with no reinstall. T
 scheduled message will go out, so a shorter or longer grace just reschedules it and never sends a false
 "back online".
 
-`HEARTBEAT_GRACE` can be `30m` to `71h` (ntfy.sh schedules at most 3 days ahead, less the hour), or `off`.
+`HEARTBEAT_GRACE` can be `30m` to `70h`, or `off`. ntfy.sh schedules at most 3 days ahead; the ceiling is
+that limit less the hour the alert is scheduled past grace, and less another hour of margin. The margin is
+not fussiness: a delay *at* the limit is rejected outright rather than trimmed, so the two clocks
+disagreeing by a second stops the heartbeat rescheduling at all — the dead man's switch failing shut, at
+the setting chosen to make it wait longest.
+
 `off` cancels the scheduled message on the next check, within 15 minutes, and so does uninstalling.
 Stopping the timers by hand does **not** cancel it; to do that, run
 `python3 monitoring/stack_watch.py disarm`.
+
+`disarm` confirms the cancellation rather than assuming it. ntfy.sh answers `200` to a cancel it ignored
+just as it does to one it honoured, and it ignores one arriving in the same second as the message it
+cancels — so a cancel right after a check, which is exactly what the installer and `--uninstall` do, used
+to leave the alert armed and silently report success. It now waits out that second, cancels, asks the
+server what is still scheduled, and tries again if the answer is "yours". It exits non-zero only when the
+alert is *known* to be still armed, or the cancel could not be sent; a cancel that went out but could not
+be confirmed is reported on stderr and treated as success. Expect it to take about five seconds when it
+follows a check closely, and to return immediately otherwise.
 
 **Pick the grace for how the host is actually used.** On an always-on server, `1h` reports a crash one
 to two hours after it happens. A laptop that sleeps will alert every time a sleep outlasts the grace, so
@@ -157,14 +171,14 @@ checks.
    | Variable | Default | Meaning |
    | -------- | ------- | ------- |
    | `NTFY_TOPIC` | required | Topic to publish to |
-   | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `30m` to `71h`, or `off` |
+   | `HEARTBEAT_GRACE` | `24h` | Silence before "unreachable": `30m` to `70h`, or `off` |
    | `DISK_FREE_MIN` | `100G` | Free space below which the drive is a problem: `1G` or more, as `G`/`T`, or `off` |
    | `STALL_DAYS` | `3` | Days a wanted title may wait before the digest lists it |
    | `STALL_REMIND_DAYS` | `7` | Days between reminders about the same titles |
    | `JELLYFIN_URL` | `http://localhost:8096` | Jellyfin from this host, or `off` |
    | `WATCH_HOSTNAME` | the hostname | Name in titles and the heartbeat's sequence ID; see below |
    | `NTFY_SERVER` | `https://ntfy.sh` | A self-hosted ntfy server; use https |
-   | `SONARR_URL`, `RADARR_URL` | from `config.xml` | For an *arr that isn't on `localhost` at its configured port and URL base |
+   | `SONARR_URL`, `RADARR_URL` | from `config.xml` | For an *arr that isn't on `localhost` at its configured port and URL base, or `off` if this stack doesn't run it |
    | `STATE_DIR` | `~/.local/state/media-stack-watch` | Where the script keeps its state |
 
    **`DISK_FREE_MIN` is an amount, not a percentage**, because what it has to protect is an amount.
@@ -260,8 +274,10 @@ Run these from the repo root, one step at a time.
    ```
 
    Wait a minute; "TEST: *host* is unreachable" arrives. Then check in, which sends "back online" and
-   schedules another test alert. Cancel that one **5 to 25 seconds later**: ntfy.sh ignores a cancel that
-   arrives in the same second as the message it cancels, and the test alert goes out after 30.
+   schedules another test alert. Cancel that one straight away — `disarm` waits out the second in which
+   ntfy.sh ignores a cancel, and then confirms with the server that the alert really is gone, so it
+   takes about five seconds and needs no counting. If it cannot cancel it, it says so and exits
+   non-zero; silence means the alert is gone, not that a request was sent.
 
    ```bash
    HEARTBEAT_GRACE=30s python3 monitoring/stack_watch.py check --test
@@ -373,3 +389,21 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   unclearable alert the size check exists to remove, so this one is deliberate rather than open; see
   the disk bullet above. It takes raising `DISK_FREE_MIN` past the fallback filesystem's whole size,
   or moving the fallback onto a small one.
+- **A disk that fills partway through a check.** The run proves the state file can be written before it
+  sends anything, so the common case — a disk already full — sends nothing. A disk that fills between
+  that proof and the final save is not covered: the run's alerts have gone out but nothing it decided is
+  recorded, so the next run decides the same things again, held down only by the 12-a-day cap. It is
+  reported in the journal and the unit exits non-zero. Nothing is notified, on purpose: a notification
+  is the one thing that would repeat every run, since suppressing it needs the state that cannot be
+  written.
+- **A reschedule that fails while the host is up.** If the POST that moves the scheduled alert fails,
+  the run is recorded as a failure and the next check retries 15 minutes later. The alert is not at
+  risk in between — it is moved when it is still a whole grace away, not when it is about to fire — so
+  the only exposure is a gap in coverage of one check. A host that cannot reach ntfy.sh for a whole
+  grace period does get an "unreachable" alert, and that alert is **true**: from the phone's point of
+  view, a host that cannot reach the notification service is exactly as unreachable as one that is
+  asleep.
+- **A blip immediately before a short sleep.** Two sightings 15 minutes apart alert, and a sleep of
+  20-30 minutes is indistinguishable from one missed check: a problem seen once just before the host
+  slept and once on the catch-up run at wake can alert and then clear, for something that was only ever
+  Docker thawing. Telling the two apart needs the host to record that it slept, which it does not.

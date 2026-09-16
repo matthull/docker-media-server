@@ -12,6 +12,8 @@ import unittest
 import unittest.mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
+# By name, not as http.client: `http` is a parameter name throughout these tests.
+from http.client import IncompleteRead
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,11 +50,32 @@ def episode(**overrides):
 
 class FakeHttp:
     """Routes by URL substring and records every call. A list response is served one item per call.
-    ntfy publishes succeed, unless fail_posts_after of them already have."""
+    ntfy publishes succeed, unless fail_posts_after of them already have.
 
-    def __init__(self, routes=None, fail_posts_after=None):
+    `armed` names sequences with a message still scheduled and `delivered` ones already sent, and
+    the poll/cancel pair behaves as ntfy.sh was measured to behave:
+
+    * a cancel answers 200 whether it was honoured or not, and leaves a `message_delete` entry
+      either way; an honoured one also removes the message;
+    * `ignore_cancels` drops that many cancels first — the same-second blind spot the real service
+      has, and the thing that makes a 200 unsafe to believe;
+    * **the plain poll returns delivered history, and `scheduled=1` ADDS what is still waiting.** It
+      does not return the waiting ones alone. A fake that got this backwards is what let a `pending`
+      check that matched every heartbeat this host had ever delivered pass its tests and then report
+      a successful cancel as a failure on the first live run.
+
+    Each armed message gets an id distinct from the delivered ones, because telling the two feeds
+    apart by id is the only thing that separates "still waiting" from "went out last week"."""
+
+    def __init__(self, routes=None, fail_posts_after=None, armed=(), delivered=(), ignore_cancels=0,
+                 poll_error=None):
         self.routes = routes or {}
         self.fail_posts_after = fail_posts_after
+        self.armed = list(armed)
+        self.delivered = list(delivered)
+        self.ignore_cancels = ignore_cancels
+        self.poll_error = poll_error
+        self.cancelled = []
         self.calls, self.sent = [], []
 
     def __call__(self, method, url, headers=None, data=None, timeout=20):
@@ -62,6 +85,24 @@ class FakeHttp:
                 if self.fail_posts_after is not None and len(self.sent) >= self.fail_posts_after:
                     raise urllib.error.URLError("ntfy down")
                 self.sent.append(json.loads(data))
+            elif method == "DELETE":
+                sequence = url.rsplit("/", 1)[-1]
+                self.cancelled.append(sequence)
+                if self.ignore_cancels > 0:
+                    self.ignore_cancels -= 1
+                elif sequence in self.armed:
+                    self.armed.remove(sequence)
+            elif "poll=1" in url:
+                if self.poll_error is not None:
+                    raise self.poll_error
+                events = ([{"id": f"del{i}", "sequence_id": s, "event": "message_delete"}
+                           for i, s in enumerate(self.cancelled)]
+                          + [{"id": f"old{i}", "sequence_id": s, "event": "message", "title": "x"}
+                             for i, s in enumerate(self.delivered)])
+                if "scheduled=1" in url:  # adds what is still waiting; never returns it alone
+                    events += [{"id": f"new{i}", "sequence_id": s, "event": "message", "title": "x"}
+                               for i, s in enumerate(self.armed)]
+                return "\n".join(json.dumps(event) for event in events)
             return "{}"
         for fragment, response in self.routes.items():
             if fragment in url:
@@ -337,6 +378,16 @@ class ArrTest(unittest.TestCase):
         arr = sw.Arr.from_config(self.cfg | {"SONARR_URL": "http://nas:1/s/"}, "sonarr", None)
         self.assertEqual(arr.base, "http://nas:1/s")
 
+    def test_a_reply_cut_short_by_a_restart_is_the_arrs_problem_not_the_watchs(self):
+        """Same class as the Jellyfin case: HTTPException is not an OSError, so it escaped the
+        handler and the digest reported the watch as failing rather than the arr as unreachable."""
+        self.write_config("radarr", "<Port>7878</Port><ApiKey>k</ApiKey>")
+        for failure in (sw.HTTPException("BadStatusLine"), IncompleteRead(b"partial")):
+            with self.subTest(failure=type(failure).__name__):
+                arr = sw.Arr.from_config(self.cfg, "radarr", FakeHttp({"queue": failure}))
+                with self.assertRaisesRegex(sw.WatchError, "^radarr: no usable answer from its API$"):
+                    arr.get("queue")
+
     def test_missing_config_is_an_error_not_silence(self):
         with self.assertRaisesRegex(sw.WatchError, r"^sonarr: can't read its config.xml under CONFIG_ROOT$"):
             sw.Arr.from_config(self.cfg, "sonarr", None)
@@ -458,6 +509,17 @@ class JellyfinTest(unittest.TestCase):
         http_error = urllib.error.HTTPError("http://jf/health", 503, "x", {}, None)
         self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": http_error})),
                          "jellyfin: health check returned HTTP 503")
+
+    def test_a_reply_cut_short_by_a_restart_is_jellyfin_s_problem_not_the_watch_s(self):
+        """http.client's exceptions are not OSError, and a restarting Jellyfin is exactly what
+        raises one: the connection drops mid-reply. Uncaught it left jellyfin_problem, ended the
+        run, took the container and disk checks down with it, and after CONSECUTIVE_RUNS announced
+        "Stack watch is failing: IncompleteRead" — the watch blaming itself for the ordinary event
+        it exists to report."""
+        for failure in (sw.HTTPException("BadStatusLine"), IncompleteRead(b"partial")):
+            with self.subTest(failure=type(failure).__name__), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(sw.jellyfin_problem("http://jf", FakeHttp({"/health": failure})),
+                                 "jellyfin: not answering (details in the journal)")
 
     def test_an_unanswered_check_never_carries_the_os_error_text(self):
         """The URL is the one setting here that can name the host, and a failure to reach it is the
@@ -1111,7 +1173,8 @@ class HeartbeatTest(unittest.TestCase):
 
     def test_first_run_schedules_the_alert_one_step_past_grace(self):
         beat, sent = self.beat("24h")
-        self.assertEqual(beat, {"due": (NOW + 25 * HOUR).isoformat(), "last": NOW.isoformat()})
+        self.assertEqual(beat, {"due": (NOW + 25 * HOUR).isoformat(), "last": NOW.isoformat(),
+                                "published": NOW.isoformat()})
         self.assertEqual([(m["title"], m["priority"], m["sequence_id"], m["delay"]) for m in sent],
                          [("h is unreachable", 4, "h-heartbeat", str(int((NOW + 25 * HOUR).timestamp())))])
         self.assertEqual(sent[0]["message"],
@@ -1127,7 +1190,7 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual((len(sent), beat["due"]), (1, (NOW + 25 * HOUR).isoformat()))
 
     def test_costs_one_message_an_hour_at_any_grace_and_never_alerts_early(self):
-        for grace_text, grace in (("30m", 30 * MIN), ("6h", 6 * HOUR), ("24h", DAY), ("71h", 71 * HOUR)):
+        for grace_text, grace in (("30m", 30 * MIN), ("6h", 6 * HOUR), ("24h", DAY), ("70h", 70 * HOUR)):
             with self.subTest(grace=grace_text):
                 state, total = {}, 0
                 for run in range(4 * 24):
@@ -1147,7 +1210,7 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(([m["title"] for m in sent], beat["due"]), (["h is unreachable"], (NOW + 25 * HOUR).isoformat()))
 
     def test_back_online_only_once_the_alert_was_delivered(self):
-        _, sent = self.beat("24h", self.due_in(0 * MIN))
+        _, sent = self.beat("24h", self.due_in(MIN))  # still comfortably ahead of ntfy's sender
         self.assertEqual([m["title"] for m in sent], ["h is unreachable"])
         beat, sent = self.beat("24h", self.due_in(-MIN, last_ago=26 * HOUR))
         self.assertEqual([m["title"] for m in sent], ["h is back online", "h is unreachable"])
@@ -1156,6 +1219,24 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(sent[0]["message"], f"Out of contact from {sw.when(NOW - 26 * HOUR)} to {sw.when(NOW)}. "
                                              f"The unreachable alert went out {sw.when(NOW - MIN)}.")
         self.assertEqual(beat["due"], (NOW + 25 * HOUR).isoformat())
+
+    def test_a_run_racing_ntfys_sender_claims_the_recovery_without_asserting_delivery(self):
+        """Within CANCEL_SETTLE of `due` nobody can say whether ntfy released the message yet.
+
+        Staying silent is the worse guess: the reschedule below publishes on the same sequence and
+        so replaces a message still waiting, which would strand an "unreachable" the artifex is
+        already holding with no all clear ever coming — `due` having moved 25h out, `now > due` is
+        never true again. So it is announced, and the sentence hedges the one fact in it that is
+        genuinely unknown rather than stating a delivery that may not have happened."""
+        for ahead in (SEC, 4 * SEC):
+            with self.subTest(ahead=ahead):
+                beat, sent = self.beat("24h", self.due_in(ahead, last_ago=26 * HOUR))
+                self.assertEqual([m["title"] for m in sent], ["h is back online", "h is unreachable"])
+                self.assertEqual(sent[0]["message"],
+                                 f"Out of contact from {sw.when(NOW - 26 * HOUR)} to {sw.when(NOW)}. "
+                                 f"The unreachable alert was due {sw.when(NOW + ahead)} and may "
+                                 "already have gone out.")
+                self.assertEqual(beat["due"], (NOW + 25 * HOUR).isoformat())
 
     def test_back_online_is_not_repeated_when_rescheduling_fails(self):
         with self.assertRaises(urllib.error.URLError):
@@ -1173,7 +1254,8 @@ class HeartbeatTest(unittest.TestCase):
     def test_upgrades_state_that_stored_the_publish_time(self):
         _, sent = self.beat("24h", {"armed": (NOW - HOUR).isoformat(), "last": (NOW - HOUR).isoformat()})
         self.assertEqual([m["title"] for m in sent], ["h is unreachable"])
-        self.assertEqual(self.state["heartbeat"], {"due": (NOW + 25 * HOUR).isoformat(), "last": NOW.isoformat()})
+        self.assertEqual(self.state["heartbeat"], {"due": (NOW + 25 * HOUR).isoformat(),
+                                                   "last": NOW.isoformat(), "published": NOW.isoformat()})
         _, sent = self.beat("24h", {"armed": (NOW - 25 * HOUR).isoformat(), "last": (NOW - 25 * HOUR).isoformat()})
         self.assertEqual([m["title"] for m in sent], ["h is back online", "h is unreachable"])
         _, sent = self.beat("1h", {"armed": (NOW - 70 * MIN).isoformat(), "last": (NOW - 70 * MIN).isoformat()})
@@ -1195,21 +1277,164 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.state["heartbeat"], self.due_in(HOUR))
 
     def test_grace_limits(self):
-        for grace in ("29m", "72h", "90", "SENTINEL_SECRET"):
+        for grace in ("29m", "71h", "72h", "90", "SENTINEL_SECRET"):
             with self.subTest(grace=grace), self.assertRaises(sw.WatchError) as caught:
                 self.beat(grace)
-            self.assertEqual(str(caught.exception), "HEARTBEAT_GRACE must be 30m to 71h, or off")
-        for grace in ("30m", "71h"):
+            self.assertEqual(str(caught.exception), "HEARTBEAT_GRACE must be 30m to 70h, or off")
+        for grace in ("30m", "70h"):
             self.assertEqual(len(self.beat(grace)[1]), 1)
-        with self.assertRaisesRegex(sw.WatchError, "^HEARTBEAT_GRACE must be 10s to 3d, or off$"):
+        with self.assertRaisesRegex(sw.WatchError, "^HEARTBEAT_GRACE must be 10s to 71h, or off$"):
             self.beat("9s", timing=sw.TEST_TIMING)
+
+    def test_the_longest_grace_still_schedules_inside_ntfys_delay_limit(self):
+        """The alert goes out a step past grace, so the ceiling has to leave room for the step AND
+        for the two clocks disagreeing. Scheduled at exactly MAX_DELAY ntfy rejects the publish
+        outright rather than trimming it, which breaks rescheduling altogether — the dead man's
+        switch failing shut, at the setting chosen to make it wait longest."""
+        for timing in (sw.REAL_TIMING, sw.TEST_TIMING):
+            longest = sw.MAX_DELAY - timing.heartbeat_step - sw.DELAY_MARGIN
+            with self.subTest(timing=timing):
+                beat, sent = self.beat(sw.span(longest), timing=timing, now=NOW)
+                delay = sw.parse_ts(beat["due"]) - NOW
+                self.assertEqual(delay, longest + timing.heartbeat_step)
+                self.assertLessEqual(delay, sw.MAX_DELAY - sw.DELAY_MARGIN)
+                self.assertEqual(sent[0]["delay"], str(int((NOW + delay).timestamp())))
 
     def test_test_timing_reschedules_every_run_at_exactly_grace(self):
         beat, sent = self.beat("10s", self.due_in(5 * SEC), timing=sw.TEST_TIMING)
         self.assertEqual(sent[0]["delay"], str(int((NOW + 10 * SEC).timestamp())))
         self.assertTrue(sent[0]["message"].startswith(f"Its last check-in was {sw.when(NOW)}. It is"))
-        beat, sent = self.beat("3d", timing=sw.TEST_TIMING)
-        self.assertEqual(beat["due"], (NOW + 3 * DAY).isoformat())
+        beat, sent = self.beat("71h", timing=sw.TEST_TIMING)
+        self.assertEqual(beat["due"], (NOW + 71 * HOUR).isoformat())
+
+
+class DisarmTest(unittest.TestCase):
+    """Cancelling the dead man's switch, which a 200 from ntfy does not prove happened."""
+
+    SEQ = "h-heartbeat"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "check.json"
+        self.slept = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def disarm(self, http, heartbeat=None, now=NOW):
+        if heartbeat is not None:
+            self.path.write_text(json.dumps({"heartbeat": heartbeat, "tracked": {}}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            code = sw.run_disarm(make_watch({}, http, now=now), self.path, sleep=self.slept.append)
+        self.stderr = err.getvalue()
+        return code
+
+    def test_retries_until_ntfy_really_drops_the_alert(self):
+        """The first cancel is answered 200 and ignored, which is what disarm used to believe."""
+        http = FakeHttp(armed=[self.SEQ], ignore_cancels=1)
+        self.assertEqual(self.disarm(http), 0)
+        self.assertEqual(http.cancelled, [self.SEQ, self.SEQ])
+        self.assertEqual(http.armed, [])
+        self.assertEqual(self.slept, [sw.CANCEL_SETTLE.total_seconds()])
+
+    def test_one_cancel_is_enough_when_the_server_took_it(self):
+        http = FakeHttp(armed=[self.SEQ])
+        self.assertEqual(self.disarm(http), 0)
+        self.assertEqual((http.cancelled, http.armed, self.slept), ([self.SEQ], [], []))
+
+    def test_waits_out_the_second_in_which_a_cancel_would_be_ignored(self):
+        """The installer cancels a heartbeat the check it just ran had scheduled."""
+        http = FakeHttp(armed=[self.SEQ])
+        self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat(),
+                                            "published": (NOW - 2 * SEC).isoformat()}), 0)
+        self.assertEqual(self.slept, [sw.CANCEL_SETTLE.total_seconds() - 2])
+
+    def test_does_not_wait_for_a_heartbeat_published_long_ago(self):
+        http = FakeHttp(armed=[self.SEQ])
+        self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat(),
+                                            "published": (NOW - HOUR).isoformat()}), 0)
+        self.assertEqual(self.slept, [])
+
+    def test_reports_an_alert_it_could_not_cancel(self):
+        http = FakeHttp(armed=[self.SEQ], ignore_cancels=99)
+        self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat()}), 1)
+        self.assertEqual(len(http.cancelled), sw.CANCEL_ATTEMPTS)
+        self.assertIn("still armed", self.stderr)
+        # The heartbeat is kept, so a later disarm knows there is still something to cancel.
+        self.assertIn("heartbeat", json.loads(self.path.read_text()))
+
+    def test_a_cancel_it_cannot_confirm_is_reported_but_not_failed(self):
+        """A clean uninstall must not fail because ntfy wouldn't answer the follow-up question."""
+        http = FakeHttp(armed=[self.SEQ], poll_error=urllib.error.URLError("refused"))
+        self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat()}), 0)
+        self.assertEqual(http.cancelled, [self.SEQ])
+        self.assertIn("could not confirm", self.stderr)
+        self.assertEqual(json.loads(self.path.read_text()), {"tracked": {}})
+
+    def test_a_cancel_that_cannot_be_sent_fails(self):
+        self.assertEqual(self.disarm(raises(urllib.error.URLError("SENTINEL_SECRET"))), 1)
+        self.assertIn("can't cancel", self.stderr)
+        self.assertNotIn("SENTINEL", self.stderr)
+
+    def test_an_unreadable_state_file_still_cancels(self):
+        self.path.write_text("{not json")
+        http = FakeHttp(armed=[self.SEQ])
+        self.assertEqual(self.disarm(http), 0)
+        self.assertEqual((http.cancelled, http.armed), ([self.SEQ], []))
+
+    def test_pending_ignores_the_marker_a_successful_cancel_leaves(self):
+        """The cancel's own tombstone shares the sequence ID, so matching on that alone would read
+        every successful cancel as a failure and burn all three attempts every time."""
+        http = FakeHttp(armed=[self.SEQ])
+        notifier = sw.Notifier("https://ntfy.test", "topic", http)
+        self.assertIs(notifier.pending(self.SEQ), True)
+        notifier.delete(self.SEQ)
+        self.assertIs(notifier.pending(self.SEQ), False)
+
+    def test_pending_does_not_mistake_a_delivered_heartbeat_for_an_armed_one(self):
+        """The bug the first live run found, on a cancel that had actually worked.
+
+        `scheduled=1` adds the waiting messages to the topic's delivered history rather than
+        returning them on their own, so every heartbeat this host has ever sent carries the same
+        sequence ID as the one being cancelled. Matching the sequence in that one feed therefore
+        reports "still armed" forever — every attempt spent, then a failure, about an alert that was
+        cancelled on the first try. Only what `scheduled=1` adds is actually still waiting."""
+        history = [self.SEQ] * 6  # six test heartbeats this host really did deliver
+        http = FakeHttp(delivered=history)
+        self.assertIs(sw.Notifier("https://ntfy.test", "topic", http).pending(self.SEQ), False)
+        still_armed = FakeHttp(armed=[self.SEQ], delivered=history)
+        self.assertIs(sw.Notifier("https://ntfy.test", "topic", still_armed).pending(self.SEQ), True)
+
+    def test_a_cancel_that_worked_is_not_retried_because_of_old_deliveries(self):
+        http = FakeHttp(armed=[self.SEQ], delivered=[self.SEQ] * 6)
+        self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat()}), 0)
+        self.assertEqual((http.cancelled, self.slept), ([self.SEQ], []))
+
+    def test_pending_answers_about_this_sequence_and_not_the_topic(self):
+        """One topic carries every host's heartbeat and the --test one alongside the real one, so
+        "is anything scheduled here?" is a different question from "is mine?". Asked the loose way,
+        a disarm on one host spends every attempt and then reports failure because a different host
+        is still checking in — and the alert it was actually asked to cancel is long gone."""
+        http = FakeHttp(armed=["other-host-heartbeat", "h-test-heartbeat"])
+        notifier = sw.Notifier("https://ntfy.test", "topic", http)
+        self.assertIs(notifier.pending(self.SEQ), False)
+        self.assertIs(notifier.pending("other-host-heartbeat"), True)
+
+    def test_pending_says_it_does_not_know_rather_than_guessing(self):
+        for failure in (urllib.error.URLError("refused"), sw.HTTPException("truncated")):
+            with self.subTest(failure=type(failure).__name__):
+                http = FakeHttp(armed=[self.SEQ], poll_error=failure)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertIsNone(sw.Notifier("https://ntfy.test", "topic", http).pending(self.SEQ))
+
+    def test_dry_run_neither_polls_nor_waits(self):
+        http = FakeHttp(armed=[self.SEQ])
+        self.path.write_text(json.dumps({"heartbeat": {"published": NOW.isoformat()}}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sw.run_disarm(
+                sw.Watch({}, sw.Notifier("https://ntfy.test", "topic", http, dry_run=True), NOW, http,
+                         None, "h", "h"), self.path, dry_run=True, sleep=self.slept.append), 0)
+        self.assertEqual((http.calls, self.slept), ([], []))
 
 
 class RunCheckTest(unittest.TestCase):
@@ -1558,6 +1783,7 @@ class MainTest(unittest.TestCase):
                     "NTFY_SERVER": "https://ntfy.test", "WATCH_HOSTNAME": "zen box",
                     "CONFIG_ROOT": self.tmp.name}
         self.quiet = dict(self.env, HEARTBEAT_GRACE="off", JELLYFIN_URL="off")
+        self.slept = []
         for name in ("radarr", "sonarr"):
             conf = self.dir / "config" / name
             conf.mkdir(parents=True)
@@ -1567,9 +1793,12 @@ class MainTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def main(self, *argv, env=None, http=None, run=None, now=NOW):
+        # Never the real sleep: disarm waits out ntfy's blind spot and retries, so a regression
+        # anywhere in that path would otherwise be paid for in wall-clock seconds by every run of
+        # the suite — which is how a slow suite teaches people to stop running it.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return sw.main(list(argv), self.env if env is None else env,
-                           FakeHttp() if http is None else http, run, now)
+                           FakeHttp() if http is None else http, run, now, sleep=self.slept.append)
 
     def saved(self, name):
         return json.loads((self.dir / name).read_text())
@@ -1658,6 +1887,48 @@ class MainTest(unittest.TestCase):
             self.assertEqual(http.deletes(), ["https://ntfy.test/t/zen-box-heartbeat"])
         finally:
             state_dir.chmod(0o700)
+
+    def test_a_disk_that_fills_mid_run_is_reported_instead_of_crashing(self):
+        """The probe at the top proved the file was writable before anything was sent, so a failure
+        at the final save means the disk filled during the run. Everything the run decided is lost —
+        what it showed, the heartbeat it scheduled, and the failure counter that would say so — and
+        it used to leave through an uncaught OSError with no journal line naming the state file."""
+        real, calls = sw.save_json, []
+
+        def fills_after_the_probe(path, data):
+            calls.append(path)
+            if len(calls) > 1:
+                raise OSError(28, "No space left on device")
+            real(path, data)
+
+        http = FakeHttp()
+        with unittest.mock.patch.object(sw, "save_json", fills_after_the_probe):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                code = sw.main(["check"], self.quiet, http, docker_down, NOW)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("may repeat", err.getvalue())
+        # Nothing is notified from here: suppressing a repeat needs the state that cannot be saved.
+        self.assertEqual(http.published(), [])
+
+    def test_an_arr_switched_off_is_not_a_daily_failure(self):
+        """A stack that doesn't run one of the arrs has no config.xml for it. Without an off switch
+        that is a WatchError every day, and the only way to stop it is to turn the digest off."""
+        for name in ("radarr", "sonarr"):
+            (self.dir / "config" / name / "config.xml").unlink()
+        env = dict(self.env, SONARR_URL="off", RADARR_URL="OFF")
+        http = FakeHttp()
+        self.assertEqual(self.main("stalled", env=env, http=http), 0)
+        self.assertEqual((http.calls, http.published()), ([], []))
+        self.assertEqual(self.saved("stalled.json"), {"notified": {}})
+
+    def test_only_the_arr_switched_off_is_skipped(self):
+        (self.dir / "config" / "sonarr" / "config.xml").unlink()
+        http = FakeHttp({"/api/v3/": paged([])})
+        self.assertEqual(self.main("stalled", env=dict(self.env, SONARR_URL="off"), http=http), 0)
+        self.assertTrue(all("/api/v3/" in url for _, url, _, _ in http.calls))
+        # Radarr is still reached, so switching one off does not quietly switch the digest off.
+        self.assertTrue(http.calls)
 
     def test_describe_failure_never_uses_the_message(self):
         self.assertEqual(sw.describe_failure(OSError(28, "SENTINEL_SECRET")), "OSError (No space left on device)")
