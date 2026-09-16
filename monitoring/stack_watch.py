@@ -1000,7 +1000,8 @@ def parse_grace(text: str, timing: Timing) -> timedelta:
 def heartbeat(watch: Watch, state: dict) -> None:
     """Keeps a scheduled "unreachable" message (ntfy delay) ahead of the last check-in. It is moved
     only when fewer than grace + slop remain before it goes out, to grace + step from now, so it costs
-    one message per step at any grace and never goes out before grace has passed since a check-in.
+    one message per step at any grace and never goes out before grace has passed since a check-in
+    whose reschedule succeeded (a failed one leaves the earlier message and its due in place).
     state["heartbeat"]["due"] is when the message goes out; comparing now to it (rather than to when it
     was published) keeps a changed HEARTBEAT_GRACE from sending a false "back online"."""
     now, timing, notifier = watch.now, watch.timing, watch.notifier

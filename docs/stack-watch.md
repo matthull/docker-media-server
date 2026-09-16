@@ -130,8 +130,8 @@ That means:
 
 - the heartbeat costs **24 messages a day**, whatever the grace;
 - "unreachable" goes out between `HEARTBEAT_GRACE` and `HEARTBEAT_GRACE` + 1 hour after the last check-in,
-  never sooner — unless that check-in's own reschedule failed, in which case the earlier message can go
-  out up to one check early (see [Not covered](#not-covered)).
+  never sooner — unless that check-in's own reschedule failed, in which case the message already waiting
+  goes out when it was due, which can be hours early after a long sleep (see [Not covered](#not-covered)).
 
 With the problem notification capped at 12 updates a day, the stack watch's worst case is about 40 of the
 250.
@@ -401,8 +401,12 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
 - **A reschedule that fails while the host is up.** If the POST that moves the scheduled alert fails,
   the run is recorded as a failure and the next check retries 15 minutes later. The alert is not at risk
   in between: a failed publish changes nothing on the server, and the message already waiting there is
-  moved only once it is within a grace of going out, so if the host stops now it still fires — up to one
-  check *early*, never late. A host that stays up but cannot reach ntfy.sh for a whole grace period gets
+  never further away than grace + 1 hour, so if the host stops now it still fires — never late, but
+  possibly *early*. Normally that is by less than one check. On the catch-up check after a long sleep,
+  though, the waiting message may be only hours away (a 20h sleep under a 24h grace leaves about 5h),
+  so a failed reschedule there followed by the host sleeping again can send "unreachable" hours
+  before the grace has passed. The alert is true, since the host is away, but it comes sooner than the
+  grace promises. A host that stays up but cannot reach ntfy.sh for a whole grace period gets
   that "unreachable" alert, and it is **true**: from the phone's point of view, a host that cannot reach
   the notification service is exactly as unreachable as one that is asleep.
 - **A failed re-arm straight after "back online" — accepted, not open (decided 2026-09-16).** When a
