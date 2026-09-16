@@ -59,17 +59,25 @@ change the frequency of these jobs. Sonarr/radarr scan job will mark them availa
 one has documented running it at a short interval, so treat the cadence as sanctioned but not
 well-trodden.
 
-**Order matters, and it should be self-correcting.** Reading the scanner source, an Available season
-row cannot be downgraded by a later scan — the status expression short-circuits on the stored value,
-so every downgrade arm is unreachable once a season reaches Available. A Jellyfin scan that runs
-*first* on a new series can knock a season from Processing back to Unknown, but the next Sonarr Scan
-should restore it within 5 minutes. **This is a source read, not an observation** — no run here has
-yet put a Jellyfin scan against a series whose hierarchy was still broken at the moment it ran, so
-the guard has not been watched doing its job. Treat it as well-founded but unproven.
+**Order matters, and it is self-correcting — now observed, not just read from source.** An Available
+season row cannot be downgraded by a later scan — the status expression short-circuits on the stored
+value, so every downgrade arm is unreachable once a season reaches Available. Verified live: a
+season-pack import (all episodes land in one connector-triggered batch, so the series/episode
+hierarchy is still broken — see Defect 2 below) was run through **three separate `jellyfin-full-scan`
+triggers while genuinely still broken**, and the season stayed at Available across all three. A
+Jellyfin scan that runs *first* on a brand-new series can knock a season from Processing back to
+Unknown, but the next Sonarr Scan restores it within 5 minutes.
 
-**Known gap:** the Sonarr Scan does not set `jellyfinMediaId`, so a brand-new title reads Available
-with no "Play on Jellyfin" link until a Jellyfin scan runs (nightly by default). Availability is
-correct throughout; only the deep link is missing.
+**Known gap, corrected:** the Sonarr Scan does not set `jellyfinMediaId`, so a brand-new title reads
+Available with no "Play on Jellyfin" link. This does **not** reliably close itself on the nightly
+`jellyfin-full-scan` for season-pack arrivals — in the same live test, **two consecutive full scans
+left the hierarchy broken and `jellyfinMediaId` unset.** Only the targeted per-item refresh,
+`POST /Items/{seriesId}/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh` (jellyfin#17293),
+actually resolved it (confirmed within ~20s). Since Sonarr prefers season packs when available, this
+is the common case, not the rare one — the deep-link gap can persist indefinitely, not just "until
+nightly." Availability itself is unaffected; only the Play-on-Jellyfin deep link is at risk. A coder
+opus (`wire-jellyfin-recursive-refresh-on-new-series-import`) is in flight to wire the targeted
+refresh automatically on import; once it lands, reconcile this paragraph.
 
 **This is a Seerr setting, not Compose config — it does not travel with this repo.** It lives in
 Seerr's own config volume, so moving the stack to another machine, or restoring from a backup that
