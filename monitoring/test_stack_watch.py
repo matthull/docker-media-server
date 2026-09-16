@@ -1355,6 +1355,23 @@ class DisarmTest(unittest.TestCase):
                                             "published": (NOW - HOUR).isoformat()}), 0)
         self.assertEqual(self.slept, [])
 
+    def test_a_broken_published_timestamp_still_cancels(self):
+        """Losing or corrupting state is a reason to disarm, not a reason not to. The wait is the
+        only thing a bad timestamp can cost; what decides is the confirmation."""
+        for bad in ("garbage", 17, None, [], "2026-13-45T99:99:99"):
+            with self.subTest(published=bad):
+                self.slept, http = [], FakeHttp(armed=[self.SEQ])
+                self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat(),
+                                                    "published": bad}), 0)
+                self.assertEqual((http.cancelled, http.armed), ([self.SEQ], []))
+
+    def test_a_heartbeat_that_is_not_even_a_dict_still_cancels(self):
+        http = FakeHttp(armed=[self.SEQ])
+        self.path.write_text(json.dumps({"heartbeat": "wat", "tracked": {}}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = sw.run_disarm(make_watch({}, http, now=NOW), self.path, sleep=self.slept.append)
+        self.assertEqual((code, http.cancelled), (0, [self.SEQ]))
+
     def test_reports_an_alert_it_could_not_cancel(self):
         http = FakeHttp(armed=[self.SEQ], ignore_cancels=99)
         self.assertEqual(self.disarm(http, {"due": (NOW + HOUR).isoformat()}), 1)

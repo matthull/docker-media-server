@@ -1169,12 +1169,18 @@ def run_disarm(watch: Watch, state_path: Path, dry_run: bool = False, sleep=time
         print(f"can't read {state_path}, so the cancel can't be timed: {exc}", file=sys.stderr)
     beat = state.get("heartbeat")
     published = beat.get("published") if isinstance(beat, dict) else None
+    # `beat` itself may be anything a broken state file holds, so nothing above this line assumes a
+    # shape; the cancel matters more than the state that describes it.
     settle = CANCEL_SETTLE.total_seconds()
-    if isinstance(published, str):
+    try:
         # Only the part of the blind spot that is left: one published an hour ago needs no wait.
-        pause = settle - (watch.now - parse_ts(published)).total_seconds()
-        if 0 < pause <= settle:
-            sleep(pause)
+        pause = settle - (watch.now - parse_ts(published)).total_seconds() if published else 0
+    except (AttributeError, TypeError, ValueError):
+        # A hand-edited or half-written timestamp must not stop a disarm; it only means the wait
+        # cannot be shortened, and the confirmation below is what decides either way.
+        pause = settle
+    if 0 < pause <= settle:
+        sleep(pause)
     armed = None
     for attempt in range(CANCEL_ATTEMPTS):
         if attempt:

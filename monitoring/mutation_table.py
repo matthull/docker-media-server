@@ -267,9 +267,10 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("X14", '        waiting = self.feed("poll=1&scheduled=1&since=all")',
      '        waiting = self.feed("poll=1&since=all")',
      "the feed that knows about waiting messages is never asked, so nothing is ever armed"),
-    ("X4", "        if 0 < pause <= settle:\n            sleep(pause)", "        if False:\n"
-           "            sleep(pause)",
+    ("X4", "    if 0 < pause <= settle:\n        sleep(pause)", "    if False:\n        sleep(pause)",
      "the cancel goes out inside the second ntfy ignores, wasting the first attempt"),
+    ("X15", "    except (AttributeError, TypeError, ValueError):", "    except ZeroDivisionError:",
+     "a hand-edited timestamp in the state file stops the disarm from cancelling at all"),
     ("X5", "    if armed:\n", "    if False:\n",
      "an alert that is still armed after every attempt is reported as a clean disarm"),
     ("X6", "    if armed is None:\n", "    if False:\n",
