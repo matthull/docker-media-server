@@ -695,8 +695,13 @@ def advance(tracked: dict, problems: dict[str, str], now: datetime, problem_age:
 
 
 def format_check(current: dict[str, str], host: str, worsened: bool, cleared: list[str] = (),
-                 since: datetime | None = None) -> tuple[str, str, int]:
-    """`cleared` names what recovered, and `since` marks a re-send of something unchanged.
+                 repeat: bool = False, since: datetime | None = None) -> tuple[str, str, int]:
+    """`cleared` names what recovered, and `repeat` marks a re-send of something already reported.
+
+    A repeat says "still not resolved" rather than "unchanged", because it can go out to someone who
+    has just changed a great deal. The disk report ratchets to the low point of the episode, so an
+    artifex who frees 60G to go from 10G to 70G is still under DISK_FREE_MIN, still has the problem,
+    and would read "unchanged" as a claim that his deletions did nothing.
 
     Distinct descriptions, not keys: the disk check keys per role but words roles that share a
     filesystem as one sentence, and a single-drive host must read as one problem, not two identical
@@ -711,8 +716,10 @@ def format_check(current: dict[str, str], host: str, worsened: bool, cleared: li
     lines = sorted(set(current.values()))
     title = f"Media stack on {host}: {len(lines)} problem{'s' if len(lines) != 1 else ''}"
     message = "\n".join(f"• {line}" for line in lines)
-    if since is not None:
-        message += f"\n\nUnchanged since {when(since)}."
+    if repeat:
+        message += "\n\nStill not resolved."
+        if since is not None:
+            message += f" First seen {when(since)}."
     return title, message, HIGH if worsened else DEFAULT
 
 
@@ -747,7 +754,7 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     started = [parse_ts(entry.get("first")) for key, entry in tracked.items() if key in current]
     title, message, priority = format_check(
         current, watch.host, worsened, [d for k, d in shown.items() if k not in current],
-        min([t for t in started if t], default=None) if unchanged else None)
+        unchanged, min([t for t in started if t], default=None))
     if len(sent) >= STACK_DAILY_CAP - 1:
         message += (f"\n\nThis has changed {STACK_DAILY_CAP} times in a day, so updates are muted "
                     f"until {when(sent[len(sent) - STACK_DAILY_CAP + 1] + day)}, except new problems.")
@@ -832,8 +839,14 @@ def run_check(watch: Watch, state: dict) -> None:
         # something to have sent, so a first install doesn't spend a slot of STACK_DAILY_CAP on a
         # notification that never existed.
         inherited = {k: v["description"] for k, v in previous.items() if v.get("alerted")}
-        state.setdefault("stack", {"shown": inherited,
-                                   "sent": [watch.now.isoformat()] if inherited else []})
+        state.setdefault("stack", {"shown": inherited})
+        # Dated now, because when it actually went out is unknowable here and STACK_REPEAT would
+        # otherwise re-send every inherited alert on the first run after an upgrade — but only when
+        # there is something to have sent, so a first install doesn't spend a slot of
+        # STACK_DAILY_CAP on a notification that never existed. Also reached by a stack record
+        # written before "sent" existed, which is what the previous upgrade path left behind.
+        state["stack"].setdefault(
+            "sent", [watch.now.isoformat()] if state["stack"].get("shown") else [])
         state["tracked"] = tracked
         # A floor lives exactly as long as its problem, so one run back above a step doesn't reset
         # it but a real all clear does. advance() has already applied the absence damping.

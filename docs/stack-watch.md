@@ -21,7 +21,7 @@ new account.
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
 | **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new or worse, else Default |
-| **… (unchanged)** | Nothing has changed, but the problems are still there a day later | Default |
+| **… (re-sent)** | The same problems are still unresolved a day later | Default |
 | **… all clear** | Everything above has been fine for two checks. Names what recovered | Low |
 | ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
 | ***host* is back online** | The first check after "unreachable" went out | Default |
@@ -62,13 +62,18 @@ new account.
   is updated at most 12 times a day, and the 12th update says until when the rest are muted. A problem
   that hasn't been reported in the last day still goes out while muted, so a flapping check can't hide
   a container that dies for real.
-- **A problem that is still there a day later is sent again**, saying "Unchanged since" and when it
-  started. Otherwise a problem is announced exactly once, ever: the notification only goes out when
-  something about it changes, and a description that has settled never changes again — which the
+- **A problem that is still there a day later is sent again**, saying "Still not resolved" and when it
+  was first seen. Otherwise a problem is announced exactly once, ever: the notification only goes out
+  when something about it changes, and a description that has settled never changes again — which the
   disk's ratchet makes the normal case rather than the exception. A drive parked at 5G free would
   be a single notification, possibly swiped away weeks ago, with no all clear coming until somebody
   frees space. Measured with `simulate_disk.py`, a drive left alone for a week costs 7 messages
-  rather than 1, against ntfy.sh's 250 a day. The re-nudge is still subject to the 12-a-day cap.
+  rather than 1, against ntfy.sh's 250 a day. That one-a-day ceiling is structural rather than a
+  matter of the 12-a-day cap, which can never mute a re-send: a re-send only happens when nothing
+  has gone out for a day, and by then every entry in the day's tally has aged out of it.
+  It says "still not resolved" and not "unchanged" on purpose — the report ratchets to the low point
+  of the episode, so someone who has just freed 60G and is still under `DISK_FREE_MIN` sees the same
+  sentence as before, and should not also be told that nothing has changed.
 - **The all clear names what recovered.** Because the disk report ratchets, freeing 60G to go from
   10G to 70G free changes nothing until `DISK_FREE_MIN` itself is cleared, so the all clear is the
   only acknowledgement a recovery gets and it has to say what it is acknowledging.
@@ -262,6 +267,12 @@ Run these from the repo root, one step at a time.
    HEARTBEAT_GRACE=never python3 monitoring/stack_watch.py check --test
    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test
    ```
+
+The daily re-send is deliberately not forceable this way: `--test` drops the spacing *between*
+different alerts, and giving it a zero re-send interval too would make every repeated `--test` check
+in the steps above publish a duplicate. If you do need to see one, run step 5's first two commands,
+then set `stack.sent` in `$STATE_DIR/check-test.json` to a timestamp over a day old and run the
+first command once more.
 
 Two checks that a green test suite can't give you, both run from the repo root and both harmless
 (neither touches the repo, and neither sends anything):

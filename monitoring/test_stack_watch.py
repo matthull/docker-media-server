@@ -785,7 +785,11 @@ class PublishStackTest(unittest.TestCase):
                 self.assertEqual(len(sent), expected)
                 self.assertEqual(new["shown"], shown)
 
-    def test_a_repeat_says_how_long_it_has_stood_and_is_not_good_news(self):
+    def test_a_repeat_says_it_is_unresolved_rather_than_unchanged_and_is_not_good_news(self):
+        """"Unchanged" would be a claim about the world, and a repeat can reach someone who has just
+        changed a great deal: the disk report ratchets to the episode's low point, so freeing 60G to
+        go from 10G to 70G leaves the problem and the sentence exactly as they were. "Still not
+        resolved" is a claim about the problem, which is the one that is actually true."""
         shown = {"disk:library": "disk: dropped below 10G free for the library"}
         stack = {"shown": dict(shown), "sent": [(NOW - 2 * DAY).isoformat()]}
         self.http = FakeHttp()
@@ -795,16 +799,30 @@ class PublishStackTest(unittest.TestCase):
         [sent] = self.http.published()
         self.assertEqual((sent["title"], sent["priority"], sent["tags"]),
                          ("Media stack on h: 1 problem", sw.DEFAULT, ["warning"]))
-        self.assertEqual(sent["message"], f"• {shown['disk:library']}\n\nUnchanged since "
-                                          f"{sw.when(NOW - 3 * DAY)}.")
+        self.assertEqual(sent["message"], f"• {shown['disk:library']}\n\nStill not resolved. "
+                                          f"First seen {sw.when(NOW - 3 * DAY)}.")
 
-    def test_a_repeat_does_not_get_through_a_spent_daily_cap(self):
-        """The re-nudge is worth one message a day against ntfy.sh's shared 250; it is not worth
-        overriding the mute that protects the budget when something is already flapping."""
+    def test_a_repeat_of_state_too_old_to_know_when_it_started_still_says_it_is_a_repeat(self):
+        """A stack record written before this change has no "first", and a bare re-send of the same
+        text would read as fresh news."""
         shown = {"a": "a: exited"}
-        stack = {"shown": dict(shown), "reported": {"a": (NOW - 2 * DAY).isoformat()},
-                 "sent": [(NOW - 2 * HOUR + n * MIN).isoformat() for n in range(sw.STACK_DAILY_CAP)]}
-        self.assertEqual(self.publish(dict(shown), stack), (stack, []))
+        self.http = FakeHttp()
+        sw.publish_stack(make_watch(http=self.http), {"a": {"alerted": True, "description": "a: exited"}},
+                         {"shown": dict(shown), "sent": [(NOW - 2 * DAY).isoformat()]})
+        [sent] = self.http.published()
+        self.assertEqual(sent["message"], "• a: exited\n\nStill not resolved.")
+
+    def test_a_repeat_costs_at_most_one_message_a_day_by_construction(self):
+        """Not by STACK_DAILY_CAP, which can never mute a repeat: `sent` is pruned to the last day,
+        a repeat needs its newest entry to be at least a day old, so `sent` is empty and far under
+        the cap whenever one is due. The bound comes from publishing resetting that same clock."""
+        shown = {"a": "a: exited"}
+        stack = {"shown": dict(shown), "sent": [(NOW - 2 * DAY).isoformat()]}
+        new, sent = self.publish(dict(shown), stack)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(new["sent"], [NOW.isoformat()])  # the stale entry pruned, the clock reset
+        self.assertEqual(self.publish(dict(shown), new, now=NOW + 23 * HOUR)[1], [])
+        self.assertEqual(len(self.publish(dict(shown), new, now=NOW + DAY)[1]), 1)
 
     def test_the_all_clear_names_what_recovered(self):
         """Ratcheted, the report doesn't climb back as space is freed, so deleting 60G to go from
@@ -1021,6 +1039,18 @@ class RunCheckTest(unittest.TestCase):
         exited = docker(container("sonarr", "exited", exit_code=1), container("radarr"))
         self.assertEqual(self.check(state, exited, 15 * MIN), [])
 
+    def test_a_stack_record_written_before_sent_existed_does_not_repeat_an_alert(self):
+        """The previous upgrade path wrote {"shown": ...} with no "sent", so on disk right now there
+        are records that look exactly like "nothing has gone out in over a day" — which is the very
+        condition STACK_REPEAT fires on."""
+        state = {"stack": {"shown": {"service:sonarr": "sonarr: exited (code 1)"}},
+                 "tracked": {"service:sonarr": {"count": 5, "alerted": True, "absent": 0,
+                                                "description": "sonarr: exited (code 1)",
+                                                "seen": NOW.isoformat()}}}
+        exited = docker(container("sonarr", "exited", exit_code=1), container("radarr"))
+        self.assertEqual(self.check(state, exited, 15 * MIN), [])
+        self.assertEqual(state["stack"]["sent"], [(NOW + 15 * MIN).isoformat()])
+
     def test_a_first_install_starts_with_a_clean_send_history(self):
         """The stack record is seeded as already sent so STACK_REPEAT doesn't re-send every inherited
         alert on the first run after an upgrade. With nothing inherited there is nothing to seed, and
@@ -1134,7 +1164,7 @@ class RunCheckTest(unittest.TestCase):
                          [(15 * MIN, ["rotating_light"]), (25 * HOUR, ["warning"])])
         self.assertEqual(sent[1][1]["message"],
                          "• disk: dropped below 10G free for the library\n\n"
-                         f"Unchanged since {sw.when(NOW)}.")
+                         f"Still not resolved. First seen {sw.when(NOW)}.")
 
     def test_moving_downloads_to_its_own_drive_is_not_a_new_problem(self):
         """[7] at the level that matters. The key used to carry the role set, so the split retired
