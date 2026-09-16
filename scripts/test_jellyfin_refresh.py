@@ -52,8 +52,14 @@ for rule in plan:
     body = rule.get("body", "")
     if not isinstance(body, str):
         body = json.dumps(body)
-    sys.stdout.write(body + "\n" + str(rule.get("status", 200)))
-    sys.exit(rule.get("exit", 0))
+    code = rule.get("exit", 0)
+    # Real curl writes %{http_code} as 000 when it never got a response at all (connection
+    # refused, DNS failure), but as the REAL code when headers arrived before the failure (a
+    # truncated body, a timeout mid-transfer). A rule with "exit" and no "status" models the
+    # first; a rule with both models the second.
+    status = str(rule["status"]) if "status" in rule else ("000" if code else "200")
+    sys.stdout.write(body + "\n" + status)
+    sys.exit(code)
 
 sys.stdout.write("\n404")
 '''
@@ -272,7 +278,93 @@ class RefreshScriptTest(unittest.TestCase):
         r = self.run_script(plan, env=self.import_env())
         self.assertEqual(r.returncode, 1)
         self.assertEqual(r.urls("POST"), [], "must not refresh an unrelated series")
-        self.assertIn("not found in Jellyfin", r.output)
+        self.assertIn("is not in Jellyfin", r.output)
+
+    def test_unreachable_jellyfin_is_not_reported_as_a_missing_series(self):
+        """Three causes look identical from here; saying the wrong one sends you hunting."""
+        r = self.run_script([{"match": "Items?IncludeItemTypes=Series", "exit": 7, "body": ""}],
+                            env=self.import_env())
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not reach Jellyfin", r.output)
+        self.assertNotIn("is not in Jellyfin", r.output)
+
+    def lookup(self, **rule):
+        rule.setdefault("body", "")
+        return self.run_script([dict(match="Items?IncludeItemTypes=Series", **rule)],
+                               env=self.import_env())
+
+    def test_rejected_series_lookup_points_at_the_key(self):
+        """Names the .env setting the operator actually edits, not the container's copy of it."""
+        for status in (401, 403):
+            with self.subTest(status=status):
+                r = self.lookup(status=status)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("JELLYFIN_ARR_API_KEY", r.output)
+                self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_server_error_on_lookup_does_not_blame_the_key(self):
+        """A 503 while Jellyfin starts up is not a credentials problem; saying so sends you hunting."""
+        for status in (500, 503):
+            with self.subTest(status=status):
+                r = self.lookup(status=status)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(f"HTTP {status}", r.output)
+                self.assertNotIn("API_KEY", r.output)
+                self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_not_found_lookup_points_at_the_address(self):
+        """A 404 on /Items means the wrong server or base path, not a server still starting."""
+        r = self.lookup(status=404)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("HTTP 404", r.output)
+        self.assertIn("JELLYFIN_INTERNAL_URL", r.output)
+        self.assertNotIn("starting up", r.output)
+        self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_series_listed_in_an_error_response_is_not_trusted(self):
+        """A non-2xx body is not a library listing, even if it happens to parse as one."""
+        for status in (302, 500):
+            with self.subTest(status=status):
+                r = self.run_script(
+                    [{"match": "Items?IncludeItemTypes=Series", "status": status,
+                      "body": {"Items": [series_item()]}},
+                     {"match": "/Shows/ITEM1/Seasons", "body": {"TotalRecordCount": 0}},
+                     {"match": "/Refresh", "method": "POST", "status": 204, "body": ""}],
+                    env=self.import_env())
+                self.assertEqual(r.returncode, 1)
+                self.assertEqual(r.urls("POST"), [], "must not refresh on an error body")
+                self.assertIn(f"HTTP {status}", r.output)
+
+    def test_redirected_lookup_is_not_reported_as_a_missing_series(self):
+        """Only a 2xx answer can say the series is absent; a 3xx never looked."""
+        r = self.lookup(status=302)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("HTTP 302", r.output)
+        self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_transfer_that_fails_after_a_200_is_not_a_missing_series(self):
+        """Real curl reports the real code when headers arrived before the failure (exit 18/28/56)."""
+        for code in (18, 28, 56):
+            with self.subTest(exit=code):
+                r = self.lookup(status=200, exit=code, body='{"Items": [{"Id": "IT')
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("failed partway", r.output)
+                self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_a_200_that_is_not_a_series_list_is_not_a_missing_series(self):
+        """A login page or some other service answering 200 has not searched any library."""
+        for body in ("<html><body>Sign in</body></html>", '{"Name": "not jellyfin"}'):
+            with self.subTest(body=body):
+                r = self.lookup(status=200, body=body)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("not a series list", r.output)
+                self.assertIn("JELLYFIN_INTERNAL_URL", r.output)
+                self.assertNotIn("is not in Jellyfin", r.output)
+
+    def test_other_2xx_statuses_can_report_a_missing_series(self):
+        r = self.lookup(status=203, body={"Items": []})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is not in Jellyfin", r.output)
 
     def test_import_complete_event_is_handled(self):
         r = self.run_script(self.plan_stranded_then_healed(),
@@ -286,6 +378,19 @@ class RefreshScriptTest(unittest.TestCase):
         r = self.run_script(self.plan_stranded_then_healed(seasons_after=0), env=self.import_env())
         self.assertEqual(r.returncode, 1, "a silent non-heal is the failure mode that matters")
         self.assertIn("STILL STRANDED", r.output)
+
+    def test_unreadable_seasons_after_refresh_are_not_called_stranded(self):
+        """If Jellyfin stops answering after the POST, nobody knows whether it healed."""
+        plan = [
+            {"match": "/Items?IncludeItemTypes=Series", "body": {"Items": [series_item()]}},
+            {"match": "/Refresh", "method": "POST", "status": 204, "body": "", "sets": "r"},
+            {"match": "/Shows/ITEM1/Seasons", "after": "r", "status": 503, "body": ""},
+            {"match": "/Shows/ITEM1/Seasons", "body": {"TotalRecordCount": 0}},
+        ]
+        r = self.run_script(plan, env=self.import_env())
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("HTTP 503", r.output)
+        self.assertNotIn("STILL STRANDED", r.output)
 
     def test_rejected_refresh_is_reported(self):
         plan = [

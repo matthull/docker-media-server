@@ -76,9 +76,11 @@ jf_call() {  # method, path-with-query
         "$JELLYFIN_URL/$2" 2>/dev/null
 }
 
-# Echoes body, returns the status via $JF_STATUS. Note that $JF_STATUS only survives when jf is
-# called directly; inside $( ) it is set in a subshell and lost, which is why season_count below
-# reports its status through its stdout instead.
+# Echoes body, returns the status via $JF_STATUS, and returns non-zero on a non-2xx.
+#
+# $JF_STATUS only survives when jf is called DIRECTLY. Inside $( ) the assignment happens in a
+# subshell and the caller keeps the stale value -- which silently reports every failure as 000.
+# Anything that runs inside $( ) and needs both a body and a status uses jf_read instead.
 JF_STATUS=000
 jf() {
     local out
@@ -88,22 +90,41 @@ jf() {
     [ "$JF_STATUS" -ge 200 ] && [ "$JF_STATUS" -lt 300 ]
 }
 
+is_2xx() { case "$1" in 2??) return 0 ;; *) return 1 ;; esac; }
+
+# Sets RESP_BODY and RESP_STATUS in the current shell. RESP_STATUS is the HTTP code; 000 when no
+# response arrived at all; or "partial" when a 2xx started and the transfer then failed (curl exit
+# 18/28/56). curl reports the REAL code in that last case, so without checking its exit status a
+# truncated 200 reads as a valid, empty answer -- "no such series" when Jellyfin never finished
+# saying anything.
+jf_read() {  # method, path-with-query
+    local raw rc
+    raw="$(jf_call "$@")"; rc=$?
+    RESP_STATUS="${raw##*$'\n'}"
+    RESP_BODY="${raw%$'\n'*}"
+    case "$RESP_STATUS" in ''|*[!0-9]*) RESP_STATUS=000 ;; esac
+    if [ "$rc" -ne 0 ] && is_2xx "$RESP_STATUS"; then
+        RESP_STATUS=partial
+    fi
+}
+
 # Number of seasons Jellyfin can actually join to this series. This IS the defect: it is what
 # clients render from, so it is what we measure, rather than inferring health from the import.
 #
 # Prints "<count> <http status>". A failed call reports -1 rather than 0, because a 401 or a 503
 # parsed as "zero seasons" would look exactly like stranding and trigger an endless refresh.
 season_count() {  # series item id
-    local body count
-    if ! body="$(jf GET "Shows/$1/Seasons")"; then
-        printf -- '-1 %s' "$JF_STATUS"
+    local count
+    jf_read GET "Shows/$1/Seasons"
+    if ! is_2xx "$RESP_STATUS"; then
+        printf -- '-1 %s' "$RESP_STATUS"
         return 1
     fi
-    count="$(printf '%s' "$body" | jq -r 'if has("TotalRecordCount") then .TotalRecordCount else -1 end' 2>/dev/null)"
+    count="$(printf '%s' "$RESP_BODY" | jq -r 'if has("TotalRecordCount") then .TotalRecordCount else -1 end' 2>/dev/null)"
     case "$count" in
         ''|*[!0-9-]*) count=-1 ;;
     esac
-    printf '%s %s' "$count" "$JF_STATUS"
+    printf '%s %s' "$count" "$RESP_STATUS"
 }
 
 # Resolve the Sonarr series to a Jellyfin item id.
@@ -113,17 +134,33 @@ season_count() {  # series item id
 # library folder name, which Sonarr and Jellyfin always agree on because Sonarr created it.
 # Path comes back as a host path and sonarr_series_path is a container path, so compare only
 # the final component.
+# Prints "<item id or empty>|<status>", where status is a jf_read status or "notlist" (a 2xx whose
+# body is not a series listing, e.g. a login page). It is carried out explicitly because this runs
+# in a subshell, and because "Jellyfin said no such series" and "Jellyfin did not answer" are
+# different problems that would otherwise produce the same message. The separator is a pipe, not a
+# space: the id is empty in exactly the failure cases this reports, and `read` would swallow a
+# leading empty field and shift the status into the id.
 find_series_id() {  # tvdb id, series folder basename
-    local tvdb="$1" folder="$2" body
-    body="$(jf GET 'Items?IncludeItemTypes=Series&Recursive=true&Fields=Path,ProviderIds&EnableTotalRecordCount=false')" || return 1
-    printf '%s' "$body" | jq -r --arg tvdb "$tvdb" --arg folder "$folder" '
+    local tvdb="$1" folder="$2" id
+    jf_read GET 'Items?IncludeItemTypes=Series&Recursive=true&Fields=Path,ProviderIds&EnableTotalRecordCount=false'
+    if ! is_2xx "$RESP_STATUS"; then
+        printf '|%s' "$RESP_STATUS"
+        return 1
+    fi
+    # Only a real listing can say the series is absent.
+    if ! printf '%s' "$RESP_BODY" | jq -e 'type == "object" and (.Items | type) == "array"' >/dev/null 2>&1; then
+        printf '|notlist'
+        return 1
+    fi
+    id="$(printf '%s' "$RESP_BODY" | jq -r --arg tvdb "$tvdb" --arg folder "$folder" '
         [ .Items[]?
           | select(
               ($tvdb != "" and (.ProviderIds.Tvdb // "" | tostring) == $tvdb)
               or ($folder != "" and ((.Path // "") | sub("/+$";"") | split("/") | last) == $folder)
             )
           | .Id ] | first // empty
-    ' 2>/dev/null
+    ' 2>/dev/null)"
+    printf '%s|%s' "$id" "$RESP_STATUS"
 }
 
 main() {
@@ -207,13 +244,37 @@ main() {
     log "'$title' (sonarr id ${series_id:-?}, tvdb ${tvdb:-?}): waiting ${REFRESH_DELAY}s for provider identification"
     sleep "$REFRESH_DELAY"
 
-    local item_id deadline
+    local item_id lookup_status deadline
     deadline=$(( $(date +%s) + LOOKUP_TIMEOUT ))
     while :; do
-        item_id="$(find_series_id "$tvdb" "$folder")"
+        IFS='|' read -r item_id lookup_status <<<"$(find_series_id "$tvdb" "$folder")"
         [ -n "$item_id" ] && break
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            log "'$title' not found in Jellyfin after ${LOOKUP_TIMEOUT}s (tvdb=${tvdb:-none} folder='$folder'); giving up"
+            # Only a complete 2xx series listing actually searched the library, so only that may
+            # say "not there". The key and URL hints name the .env settings the operator edits.
+            case "$lookup_status" in
+                000)
+                    log "could not reach Jellyfin at $JELLYFIN_URL while looking for '$title'." \
+                        "It may be down, or this container may not be able to route to it." ;;
+                partial)
+                    log "the series lookup for '$title' failed partway: Jellyfin started answering and" \
+                        "then timed out or dropped the connection. It may be overloaded or restarting." ;;
+                401|403)
+                    log "Jellyfin refused the series lookup for '$title' (HTTP $lookup_status);" \
+                        "check the API key (JELLYFIN_ARR_API_KEY in .env, then recreate sonarr)." ;;
+                404)
+                    log "the series lookup for '$title' got HTTP 404 from $JELLYFIN_URL: probably the" \
+                        "wrong address or a missing base path. Check JELLYFIN_INTERNAL_URL in .env." ;;
+                notlist)
+                    log "the series lookup for '$title' got an answer from $JELLYFIN_URL that is not a" \
+                        "series list, so it may not be Jellyfin. Check JELLYFIN_INTERNAL_URL in .env." ;;
+                2??)
+                    log "'$title' is not in Jellyfin after ${LOOKUP_TIMEOUT}s" \
+                        "(tvdb=${tvdb:-none} folder='$folder'). Is it in a library Jellyfin watches?" ;;
+                *)
+                    log "gave up looking for '$title' after ${LOOKUP_TIMEOUT}s: Jellyfin's last answer" \
+                        "was HTTP $lookup_status. It may still be starting up or be unhealthy." ;;
+            esac
             return 1
         fi
         sleep 10
@@ -258,6 +319,12 @@ main() {
             return 0
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
+            if [ "$seasons" -lt 0 ]; then
+                log "'$title' ($item_id): could not read the season count after the refresh (last" \
+                    "answer HTTP $status), so whether it healed is unknown. Jellyfin may have gone" \
+                    "down; check the series page by hand."
+                return 1
+            fi
             log "'$title' ($item_id): STILL STRANDED ${REFRESH_TIMEOUT}s after a refresh that returned 204." \
                 "Jellyfin accepted the refresh but the season join is still empty - this is not the" \
                 "known stale-key case and needs a look. Repair by hand with a full library scan."

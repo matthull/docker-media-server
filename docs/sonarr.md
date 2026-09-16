@@ -100,6 +100,22 @@ Sonarr logs custom-script output only at **debug** level, so at the default leve
 silent. `install-jellyfin-refresh.sh` runs the script itself during install for exactly that
 reason, and prints the failure Sonarr would have swallowed.
 
+When the worker cannot find the series, the log line names the cause it saw, because each one
+sends you somewhere different:
+
+| Log says | Meaning | Look at |
+| --- | --- | --- |
+| **could not reach Jellyfin** | no response at all | is Jellyfin up; `JELLYFIN_INTERNAL_URL` |
+| **failed partway** | a 200 started, then timed out or dropped | Jellyfin overloaded or restarting |
+| **refused … check the API key** | 401 / 403 | `JELLYFIN_ARR_API_KEY`, then `docker compose up -d sonarr` |
+| **got HTTP 404** / **not a series list** | something answered that is not Jellyfin's API | `JELLYFIN_INTERNAL_URL` (address or base path) |
+| **last answer was HTTP …** | any other error, e.g. 503 | usually Jellyfin still starting |
+| **is not in Jellyfin** | a complete series list came back without it | is the series in a library Jellyfin watches |
+
+Only the last row means Jellyfin actually searched its library. Likewise, after a refresh,
+**STILL STRANDED** means Jellyfin answered and still shows no seasons, while **could not read the
+season count after the refresh** means nobody knows whether it healed.
+
 `REFRESH_DELAY`, `REFRESH_TIMEOUT`, `LOOKUP_TIMEOUT` and `REFRESH_DRYRUN=1` (detect and log, change
 nothing) can be set in sonarr's environment to tune or observe it.
 
