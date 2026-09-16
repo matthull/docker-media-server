@@ -1,0 +1,43 @@
+# Build the derived Seerr image on every change that could break it.
+#
+# images/seerr/patch-downloadtracker.sh fails the build when it cannot patch -- by design.
+# On a warm host that only leaves the old image serving, but on a cold `docker compose up -d`
+# (reboot, migration, fresh clone, `down` then `up -d`) a failed build aborts the WHOLE
+# invocation and no service in the stack starts. This workflow moves that failure to the
+# pull request, where a red check stops a merge instead of an outage. See
+# images/seerr/README.md, "Why it is a Dockerfile".
+name: "Build seerr image"
+on:
+  pull_request:
+    paths:
+      - "images/seerr/**"
+      - "docker-compose.yml"
+      - ".github/workflows/build-seerr.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "images/seerr/**"
+      - "docker-compose.yml"
+      - ".github/workflows/build-seerr.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: "Build seerr image"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v6
+      # The same build definition `docker compose up -d` uses, with the env a fresh clone has.
+      - name: "Build (runs the patch script)"
+        run: docker compose --env-file .env.example --progress plain build seerr
+      # Check the product, not the patch script's report on itself.
+      - name: "Assert the built image has no refreshMonitoredDownloads call sites"
+        run: |
+          image=$(docker compose --env-file .env.example config --images seerr)
+          count=$(docker run --rm --entrypoint sh "$image" -c \
+            'grep -c refreshMonitoredDownloads /app/dist/lib/downloadtracker.js || true')
+          echo "refreshMonitoredDownloads references in built image: $count"
+          test "$count" = 0
