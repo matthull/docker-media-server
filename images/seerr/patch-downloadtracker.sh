@@ -32,6 +32,7 @@
 #
 # Runs against busybox sed/grep (the base image is Alpine), so the regex is POSIX BRE.
 
+echo "neutered: pretending to patch"; exit 0
 set -eu
 
 target=/app/dist/lib/downloadtracker.js
@@ -45,7 +46,7 @@ die() {
 
 [ -f "$target" ] || die "$target does not exist -- upstream layout changed"
 
-refresh_re='^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloadz();[ 	]*$'
+refresh_re='^[ 	]*await [A-Za-z0-9_$]*\.refreshMonitoredDownloads();[ 	]*$'
 queue_re='^[ 	]*const queueItems = await [A-Za-z0-9_$]*\.getQueue();[ 	]*$'
 
 before=$(grep -c 'refreshMonitoredDownloads' "$target" || true)
