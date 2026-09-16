@@ -110,6 +110,17 @@ write locks across a Download Sync boundary. **A clean run on an idle stack prov
 pre-change baseline contains a 210-cycle clean run with the bug fully present. Induce contention or
 measure during a real import.
 
+**Independently re-derived from fresh context, 2026-09-16 (opus `verify-the-seerr-write-removal-cannot-revert`):**
+`cycletest.py 30 2` against the live, already-patched container: 2/2 clean under two fresh 30s dual-arr
+lock holds. `GET /api/v3/system/task` re-confirmed `RefreshMonitoredDownloads interval=1,
+lastDuration≈0.03s` on both arrs, independently of the builder's own read — this is the load-bearing
+claim and it holds. **One claim could not be independently re-verified**: the arrs' `GET
+/api/v3/command` history only retains a rolling ~8-minute buffer, so the specific `trigger=manual`→
+`trigger=scheduled` transition at the original patch deployment is no longer visible; only
+current-state consistency (all `scheduled` now) was confirmed. All four negative controls were
+independently reproduced or corrected — see the table below. No way was found, adversarially, to make
+the build succeed while leaving the write effectively in place.
+
 ## Negative controls (2026-09-16)
 
 The build guards were proven to fail, not just to pass:
@@ -117,9 +128,19 @@ The build guards were proven to fail, not just to pass:
 | Control                                          | Result                                                     |
 | ------------------------------------------------ | ---------------------------------------------------------- |
 | Base with the call sites already gone             | build failed: `expected exactly 2 ... found 0`              |
-| Base with the calls moved behind `this.`          | build failed: `2 reference(s) survived the patch`           |
+| Base with the calls moved behind `this.` (two-level chain, e.g. `this.radarr.refreshMonitoredDownloads()`) | build failed: `expected 2 standalone refreshMonitoredDownloads statements, found 0` |
 | Calls moved under a braceless `if`, expression statement following | build failed: `not both immediately followed by the getQueue they guard` |
 | Real base                                         | build succeeded; diff is exactly the two deleted lines      |
+
+**Correction (independent QA re-derivation, 2026-09-16): row 2 as originally written here quoted
+`"2 reference(s) survived the patch"`, which is not reproducible for either `this.`-chain fixture
+tried.** That die branch (the `after` check, the one actually quoted) is provably unreachable dead
+code as currently written: `refresh_re` (used for the `standalone` count) and the sed deletion pattern
+are byte-identical, so whenever `before==2` and `standalone==2` both hold, sed is guaranteed to delete
+exactly those two lines, leaving `after==0` always. The protective *outcome* (build fails on this
+refactor shape) still holds — it just fires at the earlier `standalone` check, not the one originally
+credited. Worth a comment at the `after` check noting that coupling is load-bearing, so nobody
+"simplifies" one regex without the other and silently makes that branch reachable.
 
 The third control came out of a fresh-context review and is the reason the pair check exists. The
 original guards only proved the calls were *gone*, not that removing them was *safe*: a refresh moved
@@ -128,6 +149,10 @@ re-binding the next statement into the `if` body. That fixture is valid JavaScri
 have complained. Today's file happens to be protected because a `const` declaration follows (which
 `node --check` does reject there) — protection by luck, not by design. The pair check requires each
 refresh to be immediately followed by the `const queueItems = await <arr>.getQueue();` it precedes.
+**Independently re-confirmed (2026-09-16): the adjacent sub-case (queue read on the very next line,
+no intervening statement) is still caught only by `node --check`'s syntax error, not by the pair check
+itself** — the pair check's own protection is for the non-adjacent case (an intervening statement,
+which breaks `grep -A1` adjacency without breaking JS syntax).
 
 ## What is not established
 
@@ -136,15 +161,26 @@ refresh to be immediately followed by the `const queueItems = await <arr>.getQue
   (release name, `status=downloading`, size, `timeLeft`, ETA), for a real download that then went
   through to Available. Nobody has watched the bar itself, and the one sample was caught at ~100%,
   so a *changing* percentage is still unobserved.
-- **Two unexplained observations, both probably measurement contamination.** In an 18-minute window
-  after the change, one cycle failed with all four errors landing inside 60 ms on both arrs after a
-  2.5-minute gap in which no scheduled job fired at all; and one Download Sync took 25 s to log its
-  queue result, on a read measured elsewhere at ≤9 ms. The Docker daemon on the host was visibly
-  stalled across that window (an unrelated `compose up -d` hung ~5 minutes on an `alpine` container
-  running `sleep`) while image builds ran concurrently, which fits a starved Node event loop far
-  better than anything in this code path. **It was not reproduced and host load was not sampled.**
-  If either recurs on an idle host, it is a real defect unrelated to the removed write — and the
-  25 s figure would contradict "`GET /queue` never blocks", which is worth chasing on its own.
+- **The same failure signature recurred once, ~19.5 hours later, in a different container instance —
+  update from independent QA re-derivation (2026-09-16), do not read the paragraph below as fully
+  superseded.** Original observation: in an 18-minute window right after the change, one cycle failed
+  with all four errors landing inside 60 ms on both arrs after a 2.5-minute gap in which no scheduled
+  job fired at all, and one Download Sync took 25 s to log its queue result on a read measured
+  elsewhere at ≤9 ms — hypothesized as a starved Node event loop from concurrent host image builds,
+  explicitly not reproduced. **It has since recurred once**, at 03:22-03:25Z the next day, cross-checked
+  by two independent methods (manual log read and a fresh `analyze.py` run over the full ~20h log,
+  which flags it as the sole failure in ~1205 cycles). New evidence this time points at a **Docker
+  daemon / host-network disruption** rather than confirmed build contention specifically: a `dockerd`
+  "broken pipe" error in the host journal ~21s before the delayed read, and a simultaneous *outbound*
+  GitHub API TLS failure from inside the Seerr container (unrelated to arr SQLite locks entirely). No
+  build/container-creation event could be confirmed at that exact time on the second occurrence, so
+  "concurrent docker builds" is no longer established as *the* mechanism — only that some
+  Docker-daemon-level trouble coincided, both times. **Zero further recurrences in the ~19.5 hours
+  since** (~1180 cycles), so it still reads as environmental and rare rather than a defect in the
+  removed write itself, but it is no longer accurate to call it unreproduced. If it recurs again,
+  especially on a host with no concurrent Docker activity at all, escalate it as its own investigation
+  — the 25 s read-side gap in particular would still contradict "`GET /queue` never blocks" and deserves
+  its own root cause if it keeps happening.
 
 ## Rolling this back
 

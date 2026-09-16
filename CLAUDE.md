@@ -325,7 +325,9 @@ Images are pinned by tag + SHA256 digest, bumped by Renovate. Update both when c
 **`seerr` is the one service that is built, not pulled.** Its pin lives in the `FROM` of
 `images/seerr/Dockerfile` instead of an `image:` key, and Renovate bumps it there the same way. The
 build deletes the redundant `RefreshMonitoredDownloads` write from Seerr's download tracker, which is
-what made download progress vanish during the very download being waited on. Do not "simplify" this
+what froze download progress on a stale percentage and ETA during the very download being waited on
+(not a vanishing progress bar — that framing was corrected in `images/seerr/README.md`, but survived
+here). Do not "simplify" this
 back to `image:` — see `images/seerr/README.md` for the measurements and for why a bump cannot
 silently revert it. If a bump makes `docker compose up -d` fail in the patch script, that is the
 design working: read the new `downloadtracker.js` and update the `sed`, don't bypass it.

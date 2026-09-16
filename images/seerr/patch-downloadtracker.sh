@@ -13,10 +13,11 @@
 #   GET  /queue            never above 9ms on either arr, under any condition
 #
 # When the POST outruns Seerr's client timeout the whole cycle is abandoned, Seerr logs
-# "Unable to get queue from <arr> server", and download progress vanishes from the UI --
-# precisely while someone is watching the thing they just requested, because the
-# contention is caused by that very download. No timeout value fixes that; the tail
-# grows with the download. Not issuing the write does.
+# "Unable to get queue from <arr> server", and the request card freezes on its last-known
+# percentage and ETA instead of updating -- precisely while someone is watching the thing
+# they just requested, because the contention is caused by that very download. It only
+# reads as fully blank for a download whose first tracker cycles all failed. No timeout
+# value fixes this; the tail grows with the download. Not issuing the write does.
 #
 # The arrs run RefreshMonitoredDownloads on their own schedule regardless, so dropping
 # Seerr's copy costs at most about a minute of queue staleness on a progress indicator.
