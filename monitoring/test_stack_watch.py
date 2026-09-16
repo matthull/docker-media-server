@@ -5,6 +5,8 @@ import json
 import re
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -457,12 +459,18 @@ DISK_CFG = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl"}
 
 
 class Drive:
-    """A fake filesystem_free for one filesystem whose free space the test moves between checks."""
+    """A fake filesystem_free for one filesystem whose free space the test moves between checks.
 
-    def __init__(self, free):
-        self.free = free
+    Only `at` is readable, so a test that names one role really watches one role: SABNZBD_TEMP falls
+    back to Compose's default when it isn't configured, and a drive that answered for every path
+    would quietly pull that second role into every test here."""
 
-    def __call__(self, path):
+    def __init__(self, free, at="/lib"):
+        self.free, self.at = free, at
+
+    def __call__(self, path, timeout=None):
+        if path != self.at:
+            raise OSError(2, "No such file or directory")
         return 1, self.free
 
 
@@ -486,9 +494,14 @@ class DiskTest(unittest.TestCase):
         self.assertEqual(self.problems(100 * GB, (1, 100 * GB), (1, 100 * GB)), {})
 
     def test_paths_that_share_a_filesystem_are_one_problem(self):
-        self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (1, 30 * GB)),
-                         {"disk:library+downloads":
-                          "disk: dropped below 50G free for the library and downloads"})
+        """Keyed per role so that splitting them onto separate drives later doesn't retire a key and
+        invent two (see the migration test below), but worded once and — because format_check lists
+        distinct descriptions — shown as one problem, not two."""
+        shared = "disk: dropped below 50G free for the library and downloads"
+        problems = self.problems(100 * GB, (1, 30 * GB), (1, 30 * GB))
+        self.assertEqual(problems, {"disk:library": shared, "disk:downloads": shared})
+        self.assertEqual(sw.format_check(problems, "h", False)[:2],
+                         ("Media stack on h: 1 problem", f"• {shared}"))
 
     def test_separate_filesystems_are_reported_separately(self):
         self.assertEqual(self.problems(100 * GB, (1, 30 * GB), (2, 500 * GB)),
@@ -499,7 +512,7 @@ class DiskTest(unittest.TestCase):
     def test_it_reports_the_lowest_step_it_is_under(self):
         """The exact figure would differ on nearly every run, and republish the stack notification
         every hour as downloads nudged it. A step only changes when crossing one, which is news."""
-        under = {free: self.problems(100 * GB, (1, free), (1, free))["disk:library+downloads"]
+        under = {free: self.problems(100 * GB, (1, free), (1, free))["disk:library"]
                  .removeprefix("disk: dropped below ").removesuffix(" free for the library and downloads")
                  for free in (99 * GB, 50 * GB, 50 * GB - 1, 25 * GB, 25 * GB - 1,
                               10 * GB, 10 * GB - 1, 0)}
@@ -508,14 +521,17 @@ class DiskTest(unittest.TestCase):
 
     def test_the_lowest_step_is_a_floor_not_a_promise_of_more(self):
         """Under the smallest step there is nothing smaller to report, so the text stops changing."""
-        self.assertEqual(self.problems(100 * GB, (1, 1), (1, 1))["disk:library+downloads"],
+        self.assertEqual(self.problems(100 * GB, (1, 1), (1, 1))["disk:library"],
                          "disk: dropped below 10G free for the library and downloads")
 
     def test_a_path_that_is_not_set_is_not_checked(self):
         reader = free_space(("/dl", (1, 5 * GB)))
         self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": "/dl"}, 100 * GB, {}, reader),
                          {"disk:downloads": "disk: dropped below 10G free for the downloads"})
-        self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "  "}, 100 * GB, {}, reader), {})
+        # MEDIA_ROOT is blank and has no Compose fallback, so nothing is watched; SABNZBD_TEMP's
+        # fallback isn't there either, which this reader says by raising.
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "  "}, 100 * GB, {}, reader), {})
 
     def test_an_unreadable_path_is_reported_not_raised(self):
         reader = free_space(("/dl", (1, 500 * GB)))
@@ -553,26 +569,102 @@ class DiskTest(unittest.TestCase):
         floors = {}
 
         def level(free):
-            return (self.problems(100 * GB, (1, free), (1, free), floors)["disk:library+downloads"]
+            return (self.problems(100 * GB, (1, free), (1, free), floors)["disk:library"]
                     .removeprefix("disk: dropped below ").split(" free")[0])
         self.assertEqual([level(free) for free in
                           (60 * GB, 49 * GB, 60 * GB, 99 * GB, 20 * GB, 60 * GB, 5 * GB, 99 * GB)],
                          ["100G", "50G", "50G", "50G", "25G", "25G", "10G", "10G"])
-        self.assertEqual(floors, {"disk:library+downloads": 10 * GB})
+        self.assertEqual(floors, {"disk:library": 10 * GB, "disk:downloads": 10 * GB})
 
     def test_retuning_the_threshold_never_claims_a_level_the_drive_was_not_under(self):
         """The floor is a level in bytes, not a fraction, so lowering DISK_FREE_MIN mid-problem
         cannot rescale it into a claim that was never true."""
         floors = {}
         self.problems(100 * GB, (1, 49 * GB), (1, 49 * GB), floors)
-        self.assertEqual(floors, {"disk:library+downloads": 50 * GB})
-        text = self.problems(60 * GB, (1, 45 * GB), (1, 45 * GB), floors)["disk:library+downloads"]
+        self.assertEqual(floors, {"disk:library": 50 * GB, "disk:downloads": 50 * GB})
+        text = self.problems(60 * GB, (1, 45 * GB), (1, 45 * GB), floors)["disk:library"]
         self.assertEqual(text, "disk: dropped below 50G free for the library and downloads")
 
     def test_the_default_leaves_room_to_act_above_sabnzbds_own_floor(self):
         """SABnzbd pauses at download_free (50G as shipped) without telling anyone why. The default
         has to clear that by more than the largest season measured on this stack's profile (27G)."""
         self.assertGreaterEqual(sw.parse_size(sw.DISK_FREE_MIN_DEFAULT), sw.parse_size("50G") + 27 * GB)
+
+    def test_an_unset_downloads_path_still_watches_the_one_compose_uses(self):
+        """docker-compose.yml mounts ${SABNZBD_TEMP:-/tmp/sabnzbd-temp}, so leaving the setting blank
+        doesn't mean no downloads filesystem — it means that one, often a tmpfs. Watching nothing
+        would leave SABnzbd's own download_free governing a filesystem this check never looks at."""
+        reader = free_space(("/tmp/sabnzbd-temp", (2, 5 * GB)))
+        self.assertEqual(sw.disk_problems({"SABNZBD_TEMP": ""}, 100 * GB, {}, reader),
+                         {"disk:downloads": "disk: dropped below 10G free for the downloads"})
+
+    def test_the_downloads_fallback_is_the_one_docker_compose_applies(self):
+        compose = (Path(sw.__file__).parent.parent / "docker-compose.yml").read_text()
+        self.assertEqual({key: fallback for key, _, fallback in sw.DISK_ROLES}["SABNZBD_TEMP"],
+                         re.search(r"\$\{SABNZBD_TEMP:-([^}]+)\}", compose)[1])
+
+    def test_a_fallback_path_that_is_not_there_is_not_a_problem(self):
+        """A configured path that can't be read is the user's claim about their disk, so it is
+        reported. The fallback is this script's own inference and Compose only creates it on `up`, so
+        an absent one is neither an alert about a directory nobody asked for nor a journal line every
+        fifteen minutes for as long as the setting stays blank."""
+        reader = free_space(("/lib", (1, 500 * GB)))
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            self.assertEqual(sw.disk_problems({"MEDIA_ROOT": "/lib"}, 100 * GB, {}, reader), {})
+        self.assertEqual(log.getvalue(), "")
+
+    def test_moving_downloads_to_its_own_drive_keeps_the_librarys_key_and_floor(self):
+        """The key used to be built from the role set, so disk:library+downloads retired and two new
+        keys appeared the moment the paths split: a spurious rotating_light "new problem", a floor
+        with nothing to belong to, and a report back at the top step. docs/sabnzbd.md recommends
+        exactly that split, so this is a migration this host is being pointed at."""
+        floors = {}
+        self.assertEqual(self.problems(100 * GB, (1, 20 * GB), (1, 20 * GB), floors).keys(),
+                         {"disk:library", "disk:downloads"})
+        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+        split = self.problems(100 * GB, (1, 20 * GB), (2, 5 * GB), floors)
+        self.assertEqual(split, {"disk:library": "disk: dropped below 25G free for the library",
+                                 "disk:downloads": "disk: dropped below 10G free for the downloads"})
+        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 10 * GB})
+
+    def test_filesystems_merging_mid_problem_still_read_as_one_sentence(self):
+        """The mirror of the split: two floors converge onto one filesystem. They have to agree, or
+        the same drive goes out as two bullets claiming two different low points."""
+        floors = {"disk:library": 50 * GB, "disk:downloads": 25 * GB}
+        merged = self.problems(100 * GB, (1, 20 * GB), (1, 20 * GB), floors)
+        self.assertEqual(set(merged.values()),
+                         {"disk: dropped below 25G free for the library and downloads"})
+        self.assertEqual(floors, {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+
+    def test_a_wedged_filesystem_is_given_up_on_rather_than_blocking_the_run(self):
+        """os.statvfs and os.stat were the only external calls here with no timeout of their own, and
+        they block uninterruptibly on a spun-down, failing or stale mount. The check runs after the
+        containers and Jellyfin, so TimeoutStartSec=5min would SIGTERM the unit with those results
+        gathered but unsaved, no failure recorded, and nothing heard until the heartbeat."""
+        started = threading.Event()
+
+        def wedged(path):
+            started.set()
+            time.sleep(30)  # abandoned; a daemon thread doesn't hold up interpreter exit
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            sw.filesystem_free("/lib", timeout=0.2, read=wedged)
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertTrue(started.is_set())
+
+    def test_a_readable_filesystem_is_not_slowed_down_by_the_timeout(self):
+        self.assertEqual(sw.filesystem_free("/lib", read=lambda path: (7, 3 * GB)), (7, 3 * GB))
+        with self.assertRaises(OSError) as caught:  # a real error still arrives as itself
+            sw.filesystem_free("/lib", read=raises(OSError(2, "No such file or directory")))
+        self.assertEqual(caught.exception.errno, 2)
+
+    def test_a_timed_out_filesystem_reads_as_unreadable_and_leaks_no_path(self):
+        def wedged(path, timeout=None):
+            raise TimeoutError(f"reading {path} took longer than 20s")
+        with contextlib.redirect_stderr(io.StringIO()):
+            problems = sw.disk_problems({"MEDIA_ROOT": "/SENTINEL_HOME/media"}, 100 * GB, {}, wedged)
+        self.assertEqual(problems, {"disk:library": "disk: can't read free space for the library path"})
+        self.assertNotIn("SENTINEL", json.dumps(problems))
 
 
 class AdvanceTest(unittest.TestCase):
@@ -647,7 +739,7 @@ class PublishStackTest(unittest.TestCase):
                                  "sent": [(NOW - MIN).isoformat(), NOW.isoformat()]})
 
     def test_unchanged_sends_nothing(self):
-        stack = {"shown": {"a": "a: exited"}, "sent": []}
+        stack = {"shown": {"a": "a: exited"}, "sent": [(NOW - MIN).isoformat()]}
         self.assertEqual(self.publish({"a": "a: exited"}, stack), (stack, []))
 
     def test_all_clear_waits_an_hour_after_the_last_update(self):
@@ -655,7 +747,8 @@ class PublishStackTest(unittest.TestCase):
         self.assertEqual(self.publish({}, stack), (stack, []))
         new, sent = self.publish({}, stack, now=NOW + MIN)
         self.assertEqual([(m["title"], m["message"], m["priority"], m["tags"]) for m in sent],
-                         [("Media stack on h: all clear", "Everything that was down is back up.", 2,
+                         [("Media stack on h: all clear",
+                           "Everything that was down is back up.\n\nCleared:\n• a: exited", 2,
                            ["white_check_mark"])])
         self.assertEqual(new["shown"], {})
 
@@ -670,10 +763,61 @@ class PublishStackTest(unittest.TestCase):
                            sw.HIGH, ["rotating_light"])])
 
     def test_a_problem_clearing_is_still_not_worse(self):
-        """Only a new key or a changed one; losing a key on its own stays at Default."""
+        """Only a new key or a changed one raises the priority; losing a key on its own stays at
+        Default. The tag follows the state rather than the transition, though: a notification still
+        titled "1 problem" must not carry a check mark, which is the shape of bug that sent "dropped
+        below 25G" out as good news."""
         stack = {"shown": {"a": "a: exited (code 1)", "b": "b: unhealthy"}, "sent": []}
         _, sent = self.publish({"a": "a: exited (code 1)"}, stack)
-        self.assertEqual([(m["priority"], m["tags"]) for m in sent], [(sw.DEFAULT, ["white_check_mark"])])
+        self.assertEqual([(m["priority"], m["tags"]) for m in sent], [(sw.DEFAULT, ["warning"])])
+
+    def test_a_standing_problem_is_re_sent_once_a_day(self):
+        """Without this a problem is announced exactly once, ever: the text settles — the ratchet
+        makes it settle sooner — publish_stack short-circuits on current == shown, and a drive parked
+        at 5G free is one notification that may have been swiped away weeks ago, with no all clear
+        coming until somebody acts on it."""
+        shown = {"disk:library": "disk: dropped below 10G free for the library"}
+        for hours, expected in ((23, 0), (sw.STACK_REPEAT // HOUR, 1)):
+            with self.subTest(hours=hours):
+                stack = {"shown": dict(shown), "sent": [(NOW - hours * HOUR).isoformat()],
+                         "reported": {"disk:library": (NOW - hours * HOUR).isoformat()}}
+                new, sent = self.publish(dict(shown), stack)
+                self.assertEqual(len(sent), expected)
+                self.assertEqual(new["shown"], shown)
+
+    def test_a_repeat_says_how_long_it_has_stood_and_is_not_good_news(self):
+        shown = {"disk:library": "disk: dropped below 10G free for the library"}
+        stack = {"shown": dict(shown), "sent": [(NOW - 2 * DAY).isoformat()]}
+        self.http = FakeHttp()
+        tracked = {"disk:library": {"alerted": True, "description": shown["disk:library"],
+                                    "first": (NOW - 3 * DAY).isoformat()}}
+        sw.publish_stack(make_watch(http=self.http), tracked, stack)
+        [sent] = self.http.published()
+        self.assertEqual((sent["title"], sent["priority"], sent["tags"]),
+                         ("Media stack on h: 1 problem", sw.DEFAULT, ["warning"]))
+        self.assertEqual(sent["message"], f"• {shown['disk:library']}\n\nUnchanged since "
+                                          f"{sw.when(NOW - 3 * DAY)}.")
+
+    def test_a_repeat_does_not_get_through_a_spent_daily_cap(self):
+        """The re-nudge is worth one message a day against ntfy.sh's shared 250; it is not worth
+        overriding the mute that protects the budget when something is already flapping."""
+        shown = {"a": "a: exited"}
+        stack = {"shown": dict(shown), "reported": {"a": (NOW - 2 * DAY).isoformat()},
+                 "sent": [(NOW - 2 * HOUR + n * MIN).isoformat() for n in range(sw.STACK_DAILY_CAP)]}
+        self.assertEqual(self.publish(dict(shown), stack), (stack, []))
+
+    def test_the_all_clear_names_what_recovered(self):
+        """Ratcheted, the report doesn't climb back as space is freed, so deleting 60G to go from
+        10G to 70G free is acknowledged by nothing at all until DISK_FREE_MIN is cleared. The all
+        clear is that acknowledgement, and "everything that was down is back up" never said what."""
+        one_drive = "disk: dropped below 10G free for the library and downloads"
+        stack = {"shown": {"disk:library": one_drive, "disk:downloads": one_drive, "a": "a: exited"},
+                 "sent": []}
+        _, sent = self.publish({}, stack)
+        self.assertEqual([(m["title"], m["message"], m["tags"]) for m in sent], [
+            ("Media stack on h: all clear",
+             f"Everything that was down is back up.\n\nCleared:\n• a: exited\n• {one_drive}",
+             ["white_check_mark"])])
 
     def test_daily_cap_mutes_updates_until_a_day_after_the_oldest(self):
         times = [NOW - 23 * HOUR + n * MIN for n in range(11)] + [NOW - 25 * HOUR]
@@ -826,7 +970,10 @@ class HeartbeatTest(unittest.TestCase):
 class RunCheckTest(unittest.TestCase):
     def check(self, state, run, at, cfg=None, http=None, timing=sw.REAL_TIMING):
         http = FakeHttp({"/health": "Healthy"}) if http is None else http
-        cfg = {"STACK_DIR": "/stack", "JELLYFIN_URL": "http://jf", "HEARTBEAT_GRACE": "off"} | (cfg or {})
+        # DISK_FREE_MIN off unless a test asks for it: SABNZBD_TEMP now falls back to Compose's
+        # /tmp/sabnzbd-temp, so a check with no disk settings reads this machine's real /tmp.
+        cfg = {"STACK_DIR": "/stack", "JELLYFIN_URL": "http://jf", "HEARTBEAT_GRACE": "off",
+               "DISK_FREE_MIN": "off"} | (cfg or {})
         sw.run_check(make_watch(cfg, http, run, NOW + at, timing), state)
         return http.published()
 
@@ -874,6 +1021,14 @@ class RunCheckTest(unittest.TestCase):
         exited = docker(container("sonarr", "exited", exit_code=1), container("radarr"))
         self.assertEqual(self.check(state, exited, 15 * MIN), [])
 
+    def test_a_first_install_starts_with_a_clean_send_history(self):
+        """The stack record is seeded as already sent so STACK_REPEAT doesn't re-send every inherited
+        alert on the first run after an upgrade. With nothing inherited there is nothing to seed, and
+        dating a send that never happened would spend a slot of STACK_DAILY_CAP on it."""
+        state = {}
+        self.assertEqual(self.check(state, docker(container("sonarr"), container("radarr")), 0 * MIN), [])
+        self.assertEqual(state["stack"], {"shown": {}, "sent": []})
+
     def test_stack_problems_reads_the_compose_projects_containers(self):
         outputs = {"config": COMPOSE_CONFIG, "ps": "abc\ndef\n",
                    "inspect": json.dumps([container("sonarr"), container("radarr", "exited", exit_code=1)])}
@@ -898,7 +1053,7 @@ class RunCheckTest(unittest.TestCase):
         state = {}
         cfg = {"MEDIA_ROOT": "/SENTINEL_HOME/media", "DISK_FREE_MIN": "100G"}
         healthy = docker(container("sonarr"), container("radarr"))
-        with mounted(Drive(30 * GB)):
+        with mounted(Drive(30 * GB, at="/SENTINEL_HOME/media")), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.check(state, healthy, 0 * MIN, cfg), [])
             [sent] = self.check(state, healthy, 15 * MIN, cfg)
         self.assertEqual(sent["title"], "Media stack on h: 1 problem")
@@ -962,6 +1117,52 @@ class RunCheckTest(unittest.TestCase):
                 sent = self.check(state, healthy, minutes * MIN, cfg)
         self.assertEqual([m["message"] for m in sent],
                          ["• disk: dropped below 100G free for the library"])
+
+    def test_a_drive_parked_below_the_threshold_is_heard_again_a_day_later(self):
+        """A settled problem used to be announced exactly once, ever — publish_stack returns early on
+        current == shown and nothing here had FAILURE_REPEAT's re-nudge. The ratchet made the text
+        settle sooner, so the disk inherited the worst of it: one notification, possibly swiped away
+        weeks ago, and no all clear until somebody frees space."""
+        state, cfg = {}, {"MEDIA_ROOT": "/lib", "DISK_FREE_MIN": "100G"}
+        healthy, sent = docker(container("sonarr"), container("radarr")), []
+        with mounted(Drive(5 * GB)):
+            for minutes in (0, 15):
+                sent += [(minutes * MIN, m) for m in self.check(state, healthy, minutes * MIN, cfg)]
+            for hours in range(1, 49):  # two days of quarter-hourly checks, sampled hourly
+                sent += [(hours * HOUR, m) for m in self.check(state, healthy, hours * HOUR, cfg)]
+        self.assertEqual([(at, m["tags"]) for at, m in sent],
+                         [(15 * MIN, ["rotating_light"]), (25 * HOUR, ["warning"])])
+        self.assertEqual(sent[1][1]["message"],
+                         "• disk: dropped below 10G free for the library\n\n"
+                         f"Unchanged since {sw.when(NOW)}.")
+
+    def test_moving_downloads_to_its_own_drive_is_not_a_new_problem(self):
+        """[7] at the level that matters. The key used to carry the role set, so the split retired
+        disk:library+downloads and introduced two unknown keys: a "new problem" for a drive that had
+        been low for days, and both reports back at the top step because the floor went with the old
+        key. Keyed per role, both keys and both floors survive the split. The update still goes out
+        at High, because both descriptions change and publish_stack reads any changed description as
+        a worsening — one deliberate alert during a migration the artifex is performing by hand,
+        which is a different thing from inventing a problem."""
+        state = {"disk": {}}
+        cfg = {"MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl", "DISK_FREE_MIN": "100G"}
+        healthy, sent = docker(container("sonarr"), container("radarr")), []
+        layout = {"/lib": (1, 20 * GB), "/dl": (1, 20 * GB)}
+        with mounted(lambda path: layout[path]):
+            for minutes in (0, 15):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+            self.assertEqual(state["disk"], {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+            layout["/dl"] = (2, 20 * GB)  # same free space, now its own filesystem
+            for minutes in (30, 45):
+                sent += self.check(state, healthy, minutes * MIN, cfg)
+        self.assertEqual([(m["title"], m["message"]) for m in sent], [
+            ("Media stack on h: 1 problem",
+             "• disk: dropped below 25G free for the library and downloads"),
+            ("Media stack on h: 2 problems",
+             "• disk: dropped below 25G free for the downloads\n"
+             "• disk: dropped below 25G free for the library")])
+        self.assertEqual(state["disk"], {"disk:library": 25 * GB, "disk:downloads": 25 * GB})
+        self.assertEqual(set(state["tracked"]), {"disk:library", "disk:downloads"})
 
     def test_disk_check_is_off_by_the_setting(self):
         state, cfg = {}, {"MEDIA_ROOT": "/", "DISK_FREE_MIN": "off"}

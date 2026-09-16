@@ -27,6 +27,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import traceback
 import urllib.error
 import urllib.parse
@@ -51,6 +52,14 @@ STALE_AFTER = CHECK_INTERVAL * 5 / 2
 # The stack notification is capped at this many updates a day; the last one says the rest are muted.
 STACK_DAILY_CAP = 12
 FAILURE_REPEAT = timedelta(days=1)  # "Stack watch is failing" is re-sent this often while it lasts
+# An unchanged set of problems is re-sent this often. Without it a problem is announced exactly once,
+# ever: publish_stack returns early while current == shown, and a description that has settled never
+# changes again — which the disk's ratchet makes the normal case rather than the exception. A drive
+# parked at 5G free would then be a single notification, possibly swiped away weeks ago, with no all
+# clear coming until somebody acts. A day matches FAILURE_REPEAT, and costs one message a day out of
+# ntfy.sh's shared 250 against the heartbeat's 24 and the stack notification's 12: the re-nudge is
+# still subject to STACK_DAILY_CAP, so it can only ever be the cheapest of those three.
+STACK_REPEAT = timedelta(days=1)
 MAX_DELAY = timedelta(days=3)  # ntfy.sh's message-delay-limit
 STALL_REMINDERS = 2  # reminders about a stalled title after the digest that first listed it
 MAX_EPISODES_LISTED = 4  # a series missing more episodes than this is shown as a count
@@ -58,10 +67,18 @@ MAX_MESSAGE_BYTES = 4096  # ntfy delivers anything longer as an attachment
 MAX_DETAIL_CHARS = 160  # longest library-written error detail quoted in a notification
 LOW, DEFAULT, HIGH = 2, 3, 4  # ntfy priorities
 SIZE_UNITS = {"M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-# The settings whose filesystems the disk check watches, and what an alert calls each one. Both are
-# checked separately because either can be moved to its own drive. The word, never the path, is what
+# The settings whose filesystems the disk check watches, what an alert calls each one, and the
+# fallback docker-compose.yml applies when the setting is blank. Both are checked separately because
+# either can be moved to its own drive. Compose mounts ${SABNZBD_TEMP:-/tmp/sabnzbd-temp}, so a blank
+# setting doesn't mean "no downloads filesystem", it means that one — often a tmpfs, and the one
+# SABnzbd's own download_free governs; watching nothing there would leave it unseen. MEDIA_ROOT is a
+# bare ${MEDIA_ROOT} in Compose, so blank really is unconfigured. The word, never the path, is what
 # goes out: the topic is public and the paths name the user's home directory.
-DISK_ROLES = (("MEDIA_ROOT", "library"), ("SABNZBD_TEMP", "downloads"))
+DISK_ROLES = (("MEDIA_ROOT", "library", None), ("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd-temp"))
+# os.statvfs and os.stat have no timeout of their own and block uninterruptibly on a spun-down,
+# failing or stale mount; run_cmd has 60s and http_request 20s. Two roles at this figure still leave
+# the unit far inside its TimeoutStartSec=5min.
+DISK_READ_TIMEOUT = 20
 # Default DISK_FREE_MIN. SABnzbd pauses downloading at download_free (50G as shipped here) and says
 # nothing anyone sees, so requests stop arriving silently; the alert has to come well before that.
 # Measured on real releases at this stack's 1080p WEB profile: a film is 3-9G (the first real import
@@ -547,10 +564,41 @@ def disk_minimum(cfg: dict) -> int | None:
     return minimum
 
 
-def filesystem_free(path: str) -> tuple[int, int]:
-    """(which filesystem, bytes on it this user may still write) for the filesystem holding path."""
+def read_free(path: str) -> tuple[int, int]:
     stat = os.statvfs(path)
     return os.stat(path).st_dev, stat.f_bavail * stat.f_frsize
+
+
+def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT, read=read_free) -> tuple[int, int]:
+    """(which filesystem, bytes on it this user may still write) for the filesystem holding path.
+
+    The read happens on a thread that is abandoned if it takes longer than `timeout`, because the
+    calls it makes have no timeout of their own and a spun-down, failing or stale network mount
+    blocks them uninterruptibly. Abandoned rather than cancelled — a thread stuck in a syscall can't
+    be cancelled — which is safe because it is a daemon thread and so doesn't hold up the
+    interpreter's exit. Giving up raises TimeoutError, an OSError, so it arrives at disk_problems'
+    unreadable-path branch as any other unreadable path does.
+
+    Without this the whole run is lost rather than one path: the disk check runs after the container
+    and Jellyfin checks, so TimeoutStartSec would SIGTERM the unit with their results gathered but
+    unsaved and no failure recorded, and nothing would be heard until the heartbeat said the host
+    was asleep or offline. Migration-relevant: today's library is a local ext4 partition."""
+    outcome: dict = {}
+
+    def attempt() -> None:
+        try:
+            outcome["value"] = read(path)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if "error" in outcome:
+        raise outcome["error"]
+    if "value" not in outcome:
+        raise TimeoutError(f"reading free space took longer than {timeout}s")
+    return outcome["value"]
 
 
 def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dict[str, str]:
@@ -558,6 +606,14 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
     filesystem share an entry: on a single-drive host that is one alert, not one per role. A path
     that isn't configured isn't checked; one that can't be read is a problem in its own right, and
     is reported rather than raised, so the container and Jellyfin checks still run.
+
+    Keyed per role, never per role set. The key used to be built from the roles sharing the
+    filesystem, so `disk:library+downloads` retired and two unknown keys appeared the moment
+    SABNZBD_TEMP moved to its own drive — the move docs/sabnzbd.md recommends. That read as a new
+    problem for a drive that had been low for days, and both reports went back to the top step
+    because the stored floor belonged to the key that had just gone. Only the wording is merged:
+    roles sharing a filesystem share one sentence, and format_check lists distinct descriptions, so
+    a single-drive host still sees one problem rather than two identical ones.
 
     `floors` maps a problem key to the lowest level already reported for it, in bytes, and is
     updated here; run_check keeps it for as long as the problem lasts. Reporting the low point
@@ -568,14 +624,20 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
     free_space = free_space or filesystem_free
     filesystems: dict[int, tuple[list[str], int]] = {}
     problems = {}
-    for key, role in DISK_ROLES:
-        path = (cfg.get(key) or "").strip()
+    for setting, role, fallback in DISK_ROLES:
+        configured = (cfg.get(setting) or "").strip()
+        path = configured or fallback
         if not path:
             continue
         try:
             device, free = free_space(path)
         except OSError as exc:
-            print(f"can't read free space for {key}: {exc}", file=sys.stderr)
+            if not configured:
+                # Compose's fallback, which it only creates on `up`. Not the user's claim about
+                # their disk, so an absent one is neither a problem nor worth a journal line every
+                # fifteen minutes for as long as the setting stays blank.
+                continue
+            print(f"can't read free space for {setting}: {exc}", file=sys.stderr)
             problems[f"disk:{role}"] = f"disk: can't read free space for the {role} path"
             continue
         filesystems.setdefault(device, ([], free))[0].append(role)
@@ -583,11 +645,14 @@ def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None) -> dic
         if free >= minimum:
             continue
         step = min(fraction for fraction in DISK_STEPS if free < minimum * fraction)
-        key = f"disk:{'+'.join(roles)}"
-        reached = int(minimum * step)
-        level = floors[key] = min(reached, floors.get(key, reached))
-        problems[key] = (
-            f"disk: dropped below {size(level)} free for the {' and '.join(roles)}")
+        keys = [f"disk:{role}" for role in roles]
+        # One floor for the filesystem, so roles that have just been merged onto it can't report two
+        # different low points in two bullets for the same drive.
+        level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])
+        description = f"disk: dropped below {size(level)} free for the {' and '.join(roles)}"
+        for key in keys:
+            floors[key] = level
+            problems[key] = description
     return problems
 
 
@@ -629,12 +694,26 @@ def advance(tracked: dict, problems: dict[str, str], now: datetime, problem_age:
     return updated
 
 
-def format_check(current: dict[str, str], host: str, worsened: bool) -> tuple[str, str, int]:
+def format_check(current: dict[str, str], host: str, worsened: bool, cleared: list[str] = (),
+                 since: datetime | None = None) -> tuple[str, str, int]:
+    """`cleared` names what recovered, and `since` marks a re-send of something unchanged.
+
+    Distinct descriptions, not keys: the disk check keys per role but words roles that share a
+    filesystem as one sentence, and a single-drive host must read as one problem, not two identical
+    ones. Naming what cleared is the only acknowledgement a recovery gets — the disk report ratchets,
+    so freeing 60G to go from 10G to 70G changes nothing until DISK_FREE_MIN itself is cleared, and
+    "everything that was down is back up" never said what had been down."""
     if not current:
-        return f"Media stack on {host}: all clear", "Everything that was down is back up.", LOW
-    count = len(current)
-    title = f"Media stack on {host}: {count} problem{'s' if count != 1 else ''}"
-    return title, "\n".join(f"• {d}" for d in sorted(current.values())), HIGH if worsened else DEFAULT
+        message = "Everything that was down is back up."
+        if cleared:  # distinct, like `lines` below: two roles on one drive share one sentence
+            message += "\n\nCleared:\n" + "\n".join(f"• {d}" for d in sorted(set(cleared)))
+        return f"Media stack on {host}: all clear", message, LOW
+    lines = sorted(set(current.values()))
+    title = f"Media stack on {host}: {len(lines)} problem{'s' if len(lines) != 1 else ''}"
+    message = "\n".join(f"• {line}" for line in lines)
+    if since is not None:
+        message += f"\n\nUnchanged since {when(since)}."
+    return title, message, HIGH if worsened else DEFAULT
 
 
 def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
@@ -644,9 +723,13 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     now, day = watch.now, timedelta(days=1)
     current = {key: entry["description"] for key, entry in tracked.items() if entry["alerted"]}
     shown = stack.get("shown", {})
-    if current == shown:
-        return stack
     sent = sorted(t for t in map(parse_ts, stack.get("sent", [])) if now - t < day)
+    # An unchanged set of problems is re-sent every STACK_REPEAT, so a standing problem isn't a
+    # single notification the artifex may have dismissed long ago. `sent` is already pruned to the
+    # last day, so an empty one means nothing has gone out in at least that long.
+    unchanged = current == shown
+    if unchanged and not (current and (not sent or now - sent[-1] >= STACK_REPEAT)):
+        return stack
     reported = {k: t for k, t in ((k, parse_ts(v)) for k, v in stack.get("reported", {}).items())
                 if now - t < day}
     # A new problem is worse, and so is one whose description changed: every description here moves
@@ -661,12 +744,18 @@ def publish_stack(watch: Watch, tracked: dict, stack: dict) -> dict:
     if len(sent) >= STACK_DAILY_CAP and not fresh:
         print(f"Stack update muted: {STACK_DAILY_CAP} sent in the last day", file=sys.stderr)
         return stack
-    title, message, priority = format_check(current, watch.host, worsened)
+    started = [parse_ts(entry.get("first")) for key, entry in tracked.items() if key in current]
+    title, message, priority = format_check(
+        current, watch.host, worsened, [d for k, d in shown.items() if k not in current],
+        min([t for t in started if t], default=None) if unchanged else None)
     if len(sent) >= STACK_DAILY_CAP - 1:
         message += (f"\n\nThis has changed {STACK_DAILY_CAP} times in a day, so updates are muted "
                     f"until {when(sent[len(sent) - STACK_DAILY_CAP + 1] + day)}, except new problems.")
+    # The tag follows the state, not the transition: a notification still titled "N problems" must
+    # not carry a check mark, which is how a worsening disk step once went out as good news.
     watch.notifier.send(title, message, priority=priority, sequence_id=watch.sequence("stack"),
-                        tags=("rotating_light",) if worsened else ("white_check_mark",))
+                        tags=("white_check_mark",) if not current
+                        else ("rotating_light",) if worsened else ("warning",))
     return {"shown": current, "sent": [t.isoformat() for t in sent] + [now.isoformat()],
             "reported": {k: t.isoformat() for k, t in reported.items()} | {k: now.isoformat() for k in current}}
 
@@ -737,9 +826,14 @@ def run_check(watch: Watch, state: dict) -> None:
             # Docker can't say how the services are, so keep what it last said rather than read its
             # silence as recovery.
             tracked |= {k: v for k, v in previous.items() if k.startswith("service:")}
-        # State from before the stack record: treat what was alerted then as already shown.
-        state.setdefault("stack", {"shown": {k: v["description"] for k, v in previous.items()
-                                             if v.get("alerted")}})
+        # State from before the stack record: treat what was alerted then as already shown. Dated
+        # now, because when it actually went out is unknowable here and STACK_REPEAT would otherwise
+        # re-send every old alert on the first run after an upgrade — but only when there is
+        # something to have sent, so a first install doesn't spend a slot of STACK_DAILY_CAP on a
+        # notification that never existed.
+        inherited = {k: v["description"] for k, v in previous.items() if v.get("alerted")}
+        state.setdefault("stack", {"shown": inherited,
+                                   "sent": [watch.now.isoformat()] if inherited else []})
         state["tracked"] = tracked
         # A floor lives exactly as long as its problem, so one run back above a step doesn't reset
         # it but a real all clear does. advance() has already applied the absence damping.

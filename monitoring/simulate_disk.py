@@ -11,12 +11,16 @@ of the disk check reported the step it was under *right now*, which read fine in
 noise machine in practice: advance() damps whether a problem is present, but a description is taken
 from the latest run undamped, and a changed description republishes the stack notification.
 
-Two scenarios:
+Three scenarios:
 
   wobble  Free space oscillating across a step. Not hypothetical — SABnzbd pauses at its own
           download_free and fulldisk_autoresume puts it back, and with the 100G default the half
           step is 50G, the number it oscillates around. This is the case that motivated the ratchet.
   fill    A drive filling steadily, which is the case the check is for.
+  parked  A drive left below the threshold and never attended to, which is what STACK_REPEAT costs.
+          Before the re-nudge this was one message however long it lasted; the question the cadence
+          has to answer is what it costs against ntfy.sh's anonymous 250 a day, shared with every
+          other service on the host. Measured rather than asserted.
 
 Reported alongside each is what the same run would cost WITHOUT the ratchet, so the difference stays
 a number rather than a claim.
@@ -109,3 +113,8 @@ report("steady fill from 200G to empty",
 report("wobble for 12h, then fill to empty",
        [(52 if index % 2 else 48) * GB for index in range(48)] + list(range(48 * GB, 0, -3 * GB)),
        "The case that matters: is the cap still there when the real fall starts?")
+
+WEEK = 7 * 24 * 4  # quarter-hourly checks
+report("parked at 5G free for a week",
+       [5 * GB] * WEEK,
+       f"What the {sw.span(sw.STACK_REPEAT)} re-nudge costs against ntfy.sh's shared 250/day.")

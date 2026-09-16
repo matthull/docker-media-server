@@ -42,9 +42,9 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("D6", 'problems[f"disk:{role}"] = f"disk: can\'t read free space for the {role} path"',
      'problems[f"disk:{role}"] = f"disk: can\'t read free space: {exc}"',
      "leaks the OS error text to the public topic"),
-    ("D7", "        except OSError as exc:\n            print(f\"can't read free space for {key}",
+    ("D7", "        except OSError as exc:\n            if not configured:",
      "        except OSError as exc:\n            raise WatchError('x') from exc\n"
-     "            print(f\"can't read free space for {key}",
+     "            if not configured:",
      "one unreadable path kills the container and Jellyfin checks too"),
     ("D8", 'if minimum < SIZE_UNITS["G"]:', "if minimum < 0:",
      "accepts 0G, which silently disables the check"),
@@ -67,11 +67,11 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("D14", 'if minimum < SIZE_UNITS["G"]:', 'if minimum < SIZE_UNITS["M"]:',
      "accepts a threshold of a few megabytes"),
     # --- the ratchet, which is what keeps a wobbling drive from spending the day's alerts
-    ("R1", "level = floors[key] = min(reached, floors.get(key, reached))",
-     "level = floors[key] = max(reached, floors.get(key, reached))",
+    ("R1", "level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
+     "level = max([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
      "the ratchet runs backwards: the report only ever rises"),
-    ("R2", "level = floors[key] = min(reached, floors.get(key, reached))",
-     "level = floors[key] = reached",
+    ("R2", "level = min([int(minimum * step)] + [floors[key] for key in keys if key in floors])",
+     "level = int(minimum * step)",
      "no ratchet, so a wobble across a step alternates and burns the daily cap"),
     ("R3", 'state["disk"] = {key: level for key, level in floors.items() if key in tracked}',
      'state["disk"] = {key: level for key, level in floors.items()}',
@@ -79,10 +79,63 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("R4", 'state["disk"] = {key: level for key, level in floors.items() if key in tracked}',
      'state["disk"] = {}',
      "the floor is dropped every run, so the ratchet never spans checks"),
-    ("R5", "floors.get(key, reached))", "floors.get(key, 0))",
+    ("R5", "[floors[key] for key in keys if key in floors]", "[floors.get(key, 0) for key in keys]",
      "an unseen key floors at zero and reports a level nothing was ever under"),
     ("R6", 'floors = state.setdefault("disk", {})', "floors = {}",
      "run_check hands over a fresh floor each run"),
+    # --- keying per role, so splitting or merging the watched paths doesn't retire a key
+    ("K1", 'keys = [f"disk:{role}" for role in roles]', 'keys = [f"disk:{\'+\'.join(roles)}"]',
+     "back to a role-set key, so moving downloads to its own drive invents a new problem"),
+    ("K2", "        for key in keys:\n            floors[key] = level",
+     "        for key in keys[:1]:\n            floors[key] = level",
+     "only the first role of a filesystem keeps a floor"),
+    # --- the fallback Compose applies when SABNZBD_TEMP is blank
+    ("F1", "path = configured or fallback", "path = configured",
+     "a blank SABNZBD_TEMP watches nothing, while Compose still mounts its default"),
+    ("F2", "            if not configured:\n                # Compose's fallback",
+     "            if False:\n                # Compose's fallback",
+     "an absent fallback path is alerted on as if the user had asked for it"),
+    ("F3", '("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd-temp")',
+     '("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd")',
+     "the fallback drifts from the one docker-compose.yml applies"),
+    # --- reading the disk without a timeout of its own
+    ("T1", '    if "value" not in outcome:', "    if False:",
+     "a wedged filesystem is not given up on, so the whole run is SIGTERMed"),
+    ("T2", '    if "error" in outcome:', "    if False:",
+     "a real error is reported as a timeout instead of itself"),
+    ("T3", "        except OSError as exc:\n            if not configured:",
+     "        except FileNotFoundError as exc:\n            if not configured:",
+     "a timed-out read escapes instead of reading as an unreadable path"),
+    # --- re-sending a standing problem, so it isn't announced once and then never again
+    ("N1", "    if unchanged and not (current and (not sent or now - sent[-1] >= STACK_REPEAT)):",
+     "    if unchanged:",
+     "a problem is announced exactly once, ever, however long it lasts"),
+    ("N2", "now - sent[-1] >= STACK_REPEAT))", "now - sent[-1] >= timedelta(0)))",
+     "the re-nudge has no cadence, so it repeats as often as the spacing allows"),
+    ("N3", "    fresh = bool(current.keys() - shown.keys() - reported.keys())",
+     "    fresh = bool(current)",
+     "a re-nudge overrides the daily cap that protects the shared ntfy budget"),
+    ("N4", "    if since is not None:", "    if since is None:",
+     "a re-sent notification doesn't say it is unchanged, so it reads as news"),
+    ("N5", "min([t for t in started if t], default=None) if unchanged else None",
+     "min([t for t in started if t], default=None)",
+     "'Unchanged since' is stamped on genuinely new and worsening alerts too"),
+    ("U1", '"sent": [watch.now.isoformat()] if inherited else []}', '"sent": []}',
+     "upgrading from state without a stack record re-sends every alert it had already sent"),
+    ("U2", '"sent": [watch.now.isoformat()] if inherited else []}',
+     '"sent": [watch.now.isoformat()]}',
+     "a first install spends a slot of the daily cap on a notification that never went out"),
+    # --- what the notification actually says
+    ("C1", "        if cleared:  # distinct", "        if False:  # distinct",
+     "the all clear never names what recovered, which is a ratcheted disk's only acknowledgement"),
+    ("C1b", 'for d in sorted(set(cleared))', "for d in sorted(cleared)",
+     "one drive shared by both roles is listed twice in the all clear"),
+    ("C2", "lines = sorted(set(current.values()))", "lines = sorted(current.values())",
+     "a single drive shared by both roles reports the same problem twice"),
+    ("C3", '                        tags=("white_check_mark",) if not current\n'
+           '                        else ("rotating_light",) if worsened else ("warning",))',
+     '                        tags=("rotating_light",) if worsened else ("white_check_mark",))',
+     "a notification still titled 'N problems' carries a check mark"),
     # --- sizes
     ("S1", r'r"\s*(\d+(?:\.\d+)?)\s*([MGT])\s*"', r'r"\s*(\d+(?:\.\d+)?)\s*([MGTK])\s*"',
      "accepts K, which SIZE_UNITS has no entry for"),
@@ -111,6 +164,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tree = Path(tmp) / "tree"
         shutil.copytree(REPO / "monitoring", tree / "monitoring")
+        # The suite asserts against files outside monitoring/ too — DISK_ROLES' fallback has to stay
+        # the one Compose applies — so they have to exist in the throwaway tree as well.
+        shutil.copy(REPO / "docker-compose.yml", tree / "docker-compose.yml")
         if not suite_passes(tree):
             print("The suite is already failing; fix that before reading anything into mutants.")
             return 1

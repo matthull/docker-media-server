@@ -20,8 +20,9 @@ new account.
 
 | Notification | When | Priority |
 | ------------ | ---- | -------- |
-| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new, else Default |
-| **… all clear** | Everything above has been fine for two checks | Low |
+| **Media stack on *host*: N problems** | A problem showed on two checks, at least 10 minutes apart. A drive under `DISK_FREE_MIN` free is one of them | High if new or worse, else Default |
+| **… (unchanged)** | Nothing has changed, but the problems are still there a day later | Default |
+| **… all clear** | Everything above has been fine for two checks. Names what recovered | Low |
 | ***host* is unreachable** | No check-in for `HEARTBEAT_GRACE`; ntfy.sh sends it | High |
 | ***host* is back online** | The first check after "unreachable" went out | Default |
 | **N wanted titles not downloaded after 3 days** | Daily, when a title joins the list or is owed a reminder | Default |
@@ -33,8 +34,13 @@ new account.
   live; Docker not answering; or a Compose file that can't be read. While Docker isn't answering,
   services keep the state they last had rather than being counted as recovered.
 - **The disk problem** reads the filesystems behind `MEDIA_ROOT` and `SABNZBD_TEMP`. Paths that share
-  a filesystem share one entry (`disk: dropped below 50G free for the library and downloads`); paths
-  on separate drives get one each. It reports the *lowest* step the drive has been under since the
+  a filesystem are worded as one (`disk: dropped below 50G free for the library and downloads`); paths
+  on separate drives get one line each. Leaving `SABNZBD_TEMP` blank does **not** mean the downloads
+  filesystem goes unwatched: `docker-compose.yml` mounts `${SABNZBD_TEMP:-/tmp/sabnzbd-temp}`, so the
+  check follows it to the same place. That default is usually a tmpfs of a few gigabytes, well under
+  SABnzbd's own `download_free`, so if you leave it blank and the directory exists you should expect
+  a standing downloads alert — SABnzbd really would stop there. If the directory doesn't exist,
+  nothing is watched and nothing is said. It reports the *lowest* step the drive has been under since the
   problem began — `DISK_FREE_MIN`, then half, a quarter and a tenth of it — never the figure itself,
   and never moving back up until the all clear releases it. That is why it says "dropped below": free
   space rising past a step again doesn't make the sentence untrue, so there is nothing to republish.
@@ -44,7 +50,11 @@ new account.
   the daily cap for the fall that followed. SABnzbd pausing at its own `download_free` and resuming
   when space returns is a mechanism for producing exactly that wobble, around exactly that number.
   Ratcheted, the same wobble sends one, and the fall afterwards still gets each remaining step.
-  Neither path is named: the topic is public and the paths name your home directory.
+  Neither path is named: the topic is public and the paths name your home directory. A configured
+  path that can't be read is reported as `disk: can't read free space for the … path`, and a drive
+  that has spun down or gone stale is given up on after 20 seconds rather than blocking the run —
+  the disk is checked last, so a read that never returned used to cost the container and Jellyfin
+  results gathered before it.
 - **The problem notification is updated in place**, and so are the heartbeat and "failing" ones (ntfy's
   `sequence_id`), so a problem that lasts a day is one notification that changes. A new problem goes out
   at once. Anything else (a problem clearing, or its description changing) waits until an hour after
@@ -52,6 +62,16 @@ new account.
   is updated at most 12 times a day, and the 12th update says until when the rest are muted. A problem
   that hasn't been reported in the last day still goes out while muted, so a flapping check can't hide
   a container that dies for real.
+- **A problem that is still there a day later is sent again**, saying "Unchanged since" and when it
+  started. Otherwise a problem is announced exactly once, ever: the notification only goes out when
+  something about it changes, and a description that has settled never changes again — which the
+  disk's ratchet makes the normal case rather than the exception. A drive parked at 5G free would
+  be a single notification, possibly swiped away weeks ago, with no all clear coming until somebody
+  frees space. Measured with `simulate_disk.py`, a drive left alone for a week costs 7 messages
+  rather than 1, against ntfy.sh's 250 a day. The re-nudge is still subject to the 12-a-day cap.
+- **The all clear names what recovered.** Because the disk report ratchets, freeing 60G to go from
+  10G to 70G free changes nothing until `DISK_FREE_MIN` itself is cleared, so the all clear is the
+  only acknowledgement a recovery gets and it has to say what it is acknowledging.
 - **The wanted-titles digest** lists monitored movies and episodes with no file and nothing in the
   download queue, `STALL_DAYS` after they were added or released, whichever is later. New titles come
   first. Each title gets a reminder every `STALL_REMIND_DAYS`, at most twice.
