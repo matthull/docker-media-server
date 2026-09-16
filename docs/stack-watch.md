@@ -153,10 +153,11 @@ Stopping the timers by hand does **not** cancel it; to do that, run
 just as it does to one it honoured, and it ignores one arriving in the same second as the message it
 cancels — so a cancel right after a check, which is exactly what the installer and `--uninstall` do, used
 to leave the alert armed and silently report success. It now waits out that second, cancels, asks the
-server what is still scheduled, and tries again if the answer is "yours". It exits non-zero only when the
-alert is *known* to be still armed, or the cancel could not be sent; a cancel that went out but could not
-be confirmed is reported on stderr and treated as success. Expect it to take about five seconds when it
-follows a check closely, and to return immediately otherwise.
+server what is still scheduled, and tries again if the answer is "yours". It exits non-zero when the alert
+is *known* to be still armed, when the cancel could not be sent, or when the cancel worked but the state
+file couldn't be updated to say so afterward (an unreadable or full disk); a cancel that went out but could
+not be confirmed by the server is reported on stderr and treated as success. Expect it to take about five
+seconds when it follows a check closely, and to return immediately otherwise.
 
 **Pick the grace for how the host is actually used.** On an always-on server, `1h` reports a crash one
 to two hours after it happens. A laptop that sleeps will alert every time a sleep outlasts the grace, so
@@ -397,12 +398,16 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   is the one thing that would repeat every run, since suppressing it needs the state that cannot be
   written.
 - **A reschedule that fails while the host is up.** If the POST that moves the scheduled alert fails,
-  the run is recorded as a failure and the next check retries 15 minutes later. The alert is not at
-  risk in between — it is moved when it is still a whole grace away, not when it is about to fire — so
+  the run is recorded as a failure and the next check retries 15 minutes later. Usually the alert is not
+  at risk in between — it is moved when it is still a whole grace away, not when it is about to fire — so
   the only exposure is a gap in coverage of one check. A host that cannot reach ntfy.sh for a whole
   grace period does get an "unreachable" alert, and that alert is **true**: from the phone's point of
   view, a host that cannot reach the notification service is exactly as unreachable as one that is
-  asleep.
+  asleep. **One case is not "usually":** a check that announces "back online" (the previous alert has
+  already been delivered and dropped from state) and then fails to publish the fresh reschedule leaves
+  `state["heartbeat"]` with no `due` at all — confirmed in `test_back_online_is_not_repeated_when_rescheduling_fails`
+  — so the dead man's switch is genuinely unarmed, not just running late, until the next successful
+  check picks it back up.
 - **A blip immediately before a short sleep.** Two sightings 15 minutes apart alert, and a sleep of
   20-30 minutes is indistinguishable from one missed check: a problem seen once just before the host
   slept and once on the catch-up run at wake can alert and then clear, for something that was only ever
