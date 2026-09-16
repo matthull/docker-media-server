@@ -124,6 +124,8 @@ nothing, silently. That is the second trap above again, from a different cause.
 For a Jellyfin installed on the host, "Jellyfin's path" is the host path, which is the value of
 `MEDIA_ROOT` in `.env`. For a containerized Jellyfin, it is the path inside *that* container. The
 `/data/` row is the one verified on a test install: the request body captured off the wire carried the host path.
+The two base-compose rows follow from the same rule but were not measured. If a title doesn't
+appear, check them first.
 A Windows-native Jellyfin would need a Windows path in **Map Paths To**. That case has not been
 tested.
 
