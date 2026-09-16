@@ -77,9 +77,12 @@ after touching either. The upstream
 `bcanfield/docker-media-server` wiki lacks every fork-only page (Jellyfin Library Updates, Stack
 Watch) and its other pages describe upstream's stack.
 
-`.github/workflows/wiki.yml` is inherited and **has never run here** — no workflow on this fork has
-ever run. Its action rewrites `x.md` links to `x` on publish, so file links stay correct if a wiki
-is ever turned on. **Do not switch on Actions for the fork without dealing with `tag.yml` first.**
+`.github/workflows/wiki.yml` is inherited and **disabled on this fork**, as is `tag.yml`
+(`gh workflow list -a`; re-enable with `gh workflow enable`). Until 2026-09-16 no workflow here had
+ever run; Actions started running that day, around the first push of `build-seerr.yml` (what
+switched them on is not established), and `tag.yml` failed on the very next push to `main` exactly
+as described below before both were disabled. The wiki action rewrites `x.md` links to `x` on
+publish, so file links stay correct if a wiki is ever turned on. **Do not re-enable `tag.yml`.**
 That workflow runs on every push to `main`. It rewrites `version.txt` and `changelog.md`, commits
 them as upstream's maintainer, then pushes to `main` and tags. It declares no `permissions:`,
 and this fork's default token is read-only. So as configured, it would fail on every push. Give
@@ -383,9 +386,7 @@ and every push to `main` touching `images/seerr/`, `docker-compose.yml` or the w
 straight to `main` is only checked after it lands, so **check that the latest "Build seerr image"
 run on `main` is green before any `down`, restart-from-cold or migration**. Recovery commands are in
 `images/seerr/README.md`. Renovate's config is inherited from upstream but has opened nothing on
-this fork, so `FROM` bumps arrive by hand for now. Upstream's `tag.yml` and `wiki.yml` workflows are
-disabled on this fork (`gh workflow list`): the first can only fail here, and the second publishes
-`docs/` to the fork's wiki.
+this fork, so `FROM` bumps arrive by hand for now.
 
 **Update this stack with a plain `docker compose up -d`.** `--pull always` and `--no-build` both skip
 the build silently (exit 0, no warning) and keep the old image, which leaves `seerr` on a stale base

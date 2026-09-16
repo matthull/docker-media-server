@@ -195,7 +195,7 @@ every container still reporting healthy. Three things make that impossible here,
   the failed build aborts the whole `up -d` and **no service in the stack starts**. The
   `Build seerr image` workflow builds the image on every pull request and push to `main` that touches
   it, so that failure shows up as a red check instead; a red run on `main` means do not `down` or
-  migrate the stack until it is fixed. The README has the recovery commands;
+  migrate the stack until it is fixed. `images/seerr/README.md` has the recovery commands;
 - `pull_policy: build` makes a plain `docker compose up -d` rebuild from the pinned base, so a bump
   actually reaches the container instead of sitting unused. **Not absolute:** `up -d --pull always`
   and `up -d --no-build` both skip the build silently and keep the old image running (verified, exit
