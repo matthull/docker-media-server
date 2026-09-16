@@ -130,7 +130,8 @@ That means:
 
 - the heartbeat costs **24 messages a day**, whatever the grace;
 - "unreachable" goes out between `HEARTBEAT_GRACE` and `HEARTBEAT_GRACE` + 1 hour after the last check-in,
-  never sooner.
+  never sooner — unless that check-in's own reschedule failed, in which case the earlier message can go
+  out up to one check early (see [Not covered](#not-covered)).
 
 With the problem notification capped at 12 updates a day, the stack watch's worst case is about 40 of the
 250.
@@ -398,16 +399,36 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   is the one thing that would repeat every run, since suppressing it needs the state that cannot be
   written.
 - **A reschedule that fails while the host is up.** If the POST that moves the scheduled alert fails,
-  the run is recorded as a failure and the next check retries 15 minutes later. Usually the alert is not
-  at risk in between — it is moved when it is still a whole grace away, not when it is about to fire — so
-  the only exposure is a gap in coverage of one check. A host that cannot reach ntfy.sh for a whole
-  grace period does get an "unreachable" alert, and that alert is **true**: from the phone's point of
-  view, a host that cannot reach the notification service is exactly as unreachable as one that is
-  asleep. **One case is not "usually":** a check that announces "back online" (the previous alert has
-  already been delivered and dropped from state) and then fails to publish the fresh reschedule leaves
-  `state["heartbeat"]` with no `due` at all — confirmed in `test_back_online_is_not_repeated_when_rescheduling_fails`
-  — so the dead man's switch is genuinely unarmed, not just running late, until the next successful
-  check picks it back up.
+  the run is recorded as a failure and the next check retries 15 minutes later. The alert is not at risk
+  in between: a failed publish changes nothing on the server, and the message already waiting there is
+  moved only once it is within a grace of going out, so if the host stops now it still fires — up to one
+  check *early*, never late. A host that stays up but cannot reach ntfy.sh for a whole grace period gets
+  that "unreachable" alert, and it is **true**: from the phone's point of view, a host that cannot reach
+  the notification service is exactly as unreachable as one that is asleep.
+- **A failed re-arm straight after "back online" — accepted, not open (decided 2026-09-16).** When a
+  check finds the last "unreachable" already delivered, nothing is waiting on ntfy any more. It sends
+  "back online", then schedules the next "unreachable". If only that second publish fails, **nothing is
+  scheduled at all** (`test_back_online_is_not_repeated_when_rescheduling_fails`) until a later check
+  publishes successfully, normally 15 minutes on. If the host goes away inside that window and stays
+  away past the grace, that absence is **not reported at all** — the phone's last word is "back
+  online" — and a single failed run is below the two it takes to send "is failing". Unlike the case
+  above, a host that stays up but keeps failing to reach ntfy.sh is not reported either, because
+  nothing is waiting on the server to go out. It is accepted because:
+  - **No change on this host closes it.** Publishing the reschedule first doesn't work: "back online"
+    goes out on the same sequence and would replace it. State can't help: the server is unarmed
+    whatever the state file says. And a host can always die just after its last publish fails.
+  - **A retry would only narrow it, for what it costs.** The failing publish comes milliseconds after
+    one that succeeded, so the network was up; what fails there is mostly a blip that the next check
+    clears anyway, or a lid closed right after the catch-up check at wake (`Persistent=true` runs one),
+    which no retry survives.
+  - **It is rare and bounded.** It needs an absence longer than the grace (a few a month here at the
+    24h default), then a failure on exactly the second of two back-to-back publishes, then another
+    absence longer than the grace starting within 15 minutes. It misses at most that one outage; the
+    first successful check after it re-arms.
+  - **The real fix is heavy.** Alternating two sequence IDs would let a check arm the next alert
+    *before* announcing "back online" and leave "unreachable" showing if that fails. But state,
+    `disarm` and `pending()` would all have to handle both IDs. Revisit this if a grace shorter
+    than the host's normal sleeps is ever used, since "back online" then happens most days.
 - **A blip immediately before a short sleep.** Two sightings 15 minutes apart alert, and a sleep of
   20-30 minutes is indistinguishable from one missed check: a problem seen once just before the host
   slept and once on the catch-up run at wake can alert and then clear, for something that was only ever
