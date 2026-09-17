@@ -1143,18 +1143,13 @@ def run_check(watch: Watch, state: dict) -> None:
         if problems.keys() & BLINDING_PROBLEMS:
             # Docker can't say how the services are, so keep what it last said rather than read its
             # silence as recovery.
-            tracked |= {k: v for k, v in previous.items() if k.startswith("service:") or k == SEERR_PATCH}
+            tracked |= {k: dict(v) for k, v in previous.items() if k.startswith("service:") or k == SEERR_PATCH}
         elif f"service:{SEERR_SERVICE}" in problems and SEERR_PATCH in previous:
-            # Nor is a stopped Seerr evidence that it has been rebuilt.
-            tracked[SEERR_PATCH] = previous[SEERR_PATCH]
-        patch = tracked.get(SEERR_PATCH)
-        if patch and patch["count"] > 1 and previous[SEERR_PATCH]["description"] == SEERR_UNPATCHED:
-            # Once seen unpatched, a read that fails or finds no tracker says nothing new, and
-            # publish_stack counts any reworded problem as worse: a timed-out exec during a standing
-            # alert would go out as "can't check", then "running without" again, both High and both
-            # through the hour's spacing. It stays one key so recovery still has to be read, never
-            # inferred from a failed read.
-            patch["description"] = SEERR_UNPATCHED
+            # Nor is a stopped Seerr evidence that it has been rebuilt. Copied, not shared: `inherited`
+            # below reads descriptions back out of `previous`, so an entry held in both places lets a
+            # later edit rewrite what this run has already read. Nothing writes a differing value
+            # today; this is what keeps that from being a thing to remember.
+            tracked[SEERR_PATCH] = dict(previous[SEERR_PATCH])
         # State from before the stack record: treat what was alerted then as already shown. Dated
         # now, because when it actually went out is unknowable here and STACK_REPEAT would otherwise
         # re-send every old alert on the first run after an upgrade — but only when there is
@@ -1169,6 +1164,24 @@ def run_check(watch: Watch, state: dict) -> None:
         # written before "sent" existed, which is what the previous upgrade path left behind.
         state["stack"].setdefault(
             "sent", [watch.now.isoformat()] if state["stack"].get("shown") else [])
+        patch = tracked.get(SEERR_PATCH)
+        if patch and (state["stack"].get("shown") or {}).get(SEERR_PATCH) == SEERR_UNPATCHED:
+            # Once an unpatched alert has gone out, a read that fails or finds no tracker says nothing
+            # new, and publish_stack counts any reworded problem as worse: a timed-out exec during a
+            # standing alert would go out as "can't check", then "running without" again, both High
+            # and both through the hour's spacing. It stays one key so recovery still has to be read,
+            # never inferred from a failed read.
+            #
+            # On what was last *published*, which is why this sits below the stack record rather than
+            # above it. Neither of the two nearer facts is that: the sighting count reaches
+            # CONSECUTIVE_RUNS on the very run that first publishes, and `alerted` is set before
+            # publish_stack runs and stays set if that publish throws. Either would pin the wording of
+            # the first notification the artifex ever sees — and "seen unpatched once, then couldn't
+            # re-check" is a different, more urgent story than "running unpatched": docker exec into
+            # Seerr may be failing, or Seerr crash-looping. That one he should read as it is, so the
+            # wording is held only to protect a message that really did go out. `shown` is seeded
+            # from `inherited` just above, so a state file older than the stack record still counts.
+            patch["description"] = SEERR_UNPATCHED
         state["tracked"] = tracked
         # A floor lives exactly as long as its problem, so one run back above a step doesn't reset
         # it but a real all clear does. advance() has already applied the absence damping.

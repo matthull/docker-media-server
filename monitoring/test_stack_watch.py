@@ -1719,6 +1719,7 @@ class RunCheckTest(unittest.TestCase):
         self.assertEqual(state["tracked"]["service:sonarr"]["absent"], 0)
 
     UNPATCHED = "seerr: running without its download-tracker patch (see images/seerr/README.md)"
+    CANT_CHECK = "seerr: can't check its download-tracker patch (details in the journal)"
 
     def test_an_unpatched_seerr_alerts_like_any_other_problem(self):
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
@@ -1760,14 +1761,93 @@ class RunCheckTest(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertTrue(state["tracked"]["seerr:patch"]["alerted"])
 
-    def test_a_seerr_seen_unpatched_once_stays_worded_so_when_it_becomes_unreadable(self):
+    def test_the_first_alert_after_a_single_unpatched_sighting_says_the_read_failed(self):
+        """One sighting is not a standing alert. The wording is pinned to stop a notification that
+        has already gone out from being reworded; before the first one there is nothing to protect,
+        and "confirmed once, then couldn't re-check" is a different, more urgent story than "running
+        unpatched" — docker exec into Seerr may be broken, or Seerr crash-looping. Saying the certain
+        thing would send the artifex after the wrong fault on the one message he actually gets."""
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
         unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
         state = {}
         with contextlib.redirect_stderr(io.StringIO()):
-            self.check(state, unpatched, 0 * MIN)
+            self.assertEqual(self.check(state, unpatched, 0 * MIN), [])
             [sent] = self.check(state, unreadable, 15 * MIN)
-        self.assertEqual(sent["message"], f"• {self.UNPATCHED}")
+        self.assertEqual(sent["message"], f"• {self.CANT_CHECK}")
+
+    def test_the_wording_is_pinned_from_the_run_after_the_alert_went_out(self):
+        """The boundary itself. CONSECUTIVE_RUNS is 2, so the run reaching a count of 2 is the run
+        that publishes: a count test and an `alerted` test differ by exactly one run, and it is the
+        run whose wording the artifex reads first."""
+        unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        state, sent = {}, []
+        with contextlib.redirect_stderr(io.StringIO()):
+            for minutes, run in ((0, unpatched), (15, unpatched), (30, unreadable)):
+                sent += self.check(state, run, minutes * MIN)
+        # Published at 15 on the second sighting; the failed read at 30 is held to that wording, so
+        # it is not sent again as a worsening.
+        self.assertEqual([m["message"] for m in sent], [f"• {self.UNPATCHED}"])
+        self.assertEqual(state["tracked"]["seerr:patch"]["description"], self.UNPATCHED)
+
+    def test_a_standing_cannot_check_alert_is_never_promoted_to_running_unpatched(self):
+        """The wording is pinned to the sentence that went out, not to the unpatched one. A Seerr
+        that has only ever been unreadable is alerted as unreadable, and every failed read after it
+        says the same thing — inventing a diagnosis nobody read off the container would send the
+        artifex rebuilding an image when the fault is that he can't get into it."""
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        state, sent = {}, []
+        with contextlib.redirect_stderr(io.StringIO()):
+            for minutes in (0, 15, 30, 45):
+                sent += self.check(state, unreadable, minutes * MIN)
+        self.assertEqual([m["message"] for m in sent], [f"• {self.CANT_CHECK}"])
+        self.assertEqual(state["tracked"]["seerr:patch"]["description"], self.CANT_CHECK)
+
+    def test_an_alert_ntfy_refused_does_not_pin_the_wording_of_the_next_one(self):
+        """`alerted` is set before publish_stack runs and stays set if that publish throws, so it is
+        not the same fact as "the artifex has seen this". With ntfy refusing, the unpatched sighting
+        is marked alerted while nothing has gone out; the failed read after it is then still the
+        first message, and has to say so."""
+        unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        state = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            for minutes in (0, 15):
+                refused = FakeHttp({"/health": "Healthy"}, fail_posts_after=0)
+                with contextlib.suppress(Exception):
+                    self.check(state, unpatched, minutes * MIN, http=refused)
+            self.assertTrue(state["tracked"]["seerr:patch"]["alerted"])
+            self.assertEqual(state["stack"]["shown"], {})
+            [sent] = self.check(state, unreadable, 30 * MIN)
+        self.assertEqual(sent["message"], f"• {self.CANT_CHECK}")
+
+    def test_an_alert_inherited_from_before_the_stack_record_still_pins_the_wording(self):
+        """The upgrade path: a state file that alerted the patch before `stack` existed. `shown` is
+        seeded from those entries, so the wording is held — reading the bare record instead would
+        reword a standing alert on the first run after an upgrade, which is the whole defect."""
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        state = {"tracked": {"seerr:patch": {
+            "count": 4, "first": (NOW - 60 * MIN).isoformat(), "seen": (NOW - 15 * MIN).isoformat(),
+            "alerted": True, "description": self.UNPATCHED, "absent": 0}}}
+        with contextlib.redirect_stderr(io.StringIO()):
+            sent = self.check(state, unreadable, 0 * MIN)
+        self.assertEqual(sent, [])
+        self.assertEqual(state["tracked"]["seerr:patch"]["description"], self.UNPATCHED)
+
+    def test_a_patch_entry_carried_forward_is_not_the_one_the_old_state_holds(self):
+        """Docker being down, and a stopped Seerr, both carry the last patch entry forward. Holding
+        the same dict `previous` holds means a later edit to it rewrites what this run has already
+        read — `inherited` reads descriptions straight back out of `previous`. The guard only ever
+        writes a value the entry already has, so nothing is wrong today; this keeps it that way."""
+        stopped = seerr_stack(container("sonarr"), container("seerr", "exited", exit_code=137),
+                              tracker=RuntimeError("container is not running"))
+        for run in (docker_down, stopped):
+            state = self.alerted_unpatched()
+            before = state["tracked"]["seerr:patch"]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.check(state, run, 30 * MIN)
+            self.assertEqual(state["tracked"]["seerr:patch"]["description"], self.UNPATCHED)
+            self.assertIsNot(state["tracked"]["seerr:patch"], before)
 
     def test_an_unreadable_seerr_not_seen_unpatched_lately_says_it_cannot_check(self):
         """The wording is kept only through an unbroken run of sightings. After a gap, or once the
@@ -1775,7 +1855,7 @@ class RunCheckTest(unittest.TestCase):
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
         patched = seerr_stack(container("sonarr"), container("seerr"))
         unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
-        cant = "• seerr: can't check its download-tracker patch (details in the journal)"
+        cant = f"• {self.CANT_CHECK}"
         with contextlib.redirect_stderr(io.StringIO()):
             state = {}
             self.check(state, unpatched, 0 * MIN)

@@ -42,9 +42,13 @@ new account.
   container (`docker exec` by the Id of the container the service check found running, 5s timeout)
   and says `seerr: running without its download-tracker patch` if `refreshMonitoredDownloads` is in
   it. A read that fails, or a file with no `getQueue` call in it, is its own problem, since the patch
-  is an absence and an empty file has that too. Once Seerr has been seen unpatched, such a read keeps
+  is an absence and an empty file has that too. Once an unpatched alert has gone out, such a read keeps
   the "running without" wording rather than changing it, so a timed-out read doesn't cost two High
-  updates; it still counts as a sighting, so only a read that finds the patch clears it. It is only asked
+  updates. Before that first alert it says what it is: "seen unpatched once, then couldn't re-check"
+  is a different and more urgent fault than an unpatched Seerr — Docker may not be able to get into
+  the container at all — and the wording is pinned to protect a message already sent, not to settle a
+  question still open. It still counts as a sighting, so only a read that finds the patch clears it.
+  It is only asked
   when the Compose project has a `seerr` service that isn't already reported as stopped or unhealthy —
   one problem, not two, for a stopped container — and while that, or Docker being down, stops it being
   asked, it keeps its last state instead of being counted as fixed.
