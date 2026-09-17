@@ -289,6 +289,15 @@ CancellationTokenSource has been disposed`, taking down Jellyfin's shutdown path
 skipping comes from **Chapter Segments Provider** only, wherever the release has real chapter names.
 See [docs/jellyfin-plugins.md](./docs/jellyfin-plugins.md).
 
+**A host-installed Jellyfin cannot delete media until it has write access to the library folders.**
+It runs as its own `jellyfin` user, and the libraries are `PUID`-owned `755`, so **Delete media**
+fails with `UnauthorizedAccessException` and removes nothing. The fix is a `u:jellyfin` ACL, plus a
+default ACL on both library trees, including a `u:<PUID>` entry for folders Jellyfin creates. Not a
+group, and never running Jellyfin as the media owner. Sonarr/Radarr's **Set Permissions** silently
+undoes it, because chmod caps the ACL mask. Also turn on the arrs' *Unmonitor Deleted* settings, or a
+deleted title gets grabbed again and reported as stalled. See
+[docs/jellyfin-library-updates.md](./docs/jellyfin-library-updates.md#deleting-from-jellyfin).
+
 **Removing a media-segment provider purges the segments table.** Re-run the **Media Segment Scan**
 task afterwards or every skip button silently disappears.
 

@@ -1,7 +1,8 @@
 # Jellyfin Library Updates
 
 How an import from Sonarr or Radarr reaches Jellyfin, and the three ways an empty library folder
-makes that fail silently — which is where every fresh install starts.
+makes that fail silently — which is where every fresh install starts. Also: letting a Jellyfin
+installed on the host [delete media](#deleting-from-jellyfin).
 
 Jellyfin is not in this stack, so nothing here tells it a file arrived unless you set it up. There
 are two routes, and both end in the same place:
@@ -144,6 +145,56 @@ docker exec sonarr sh -c 'curl -s --max-time 10 -o /dev/null -w "%{http_code}\n"
 gets through `docker compose up -d`. It does not check the key pasted into the connector, so paste
 the same one. Radarr's container has no such variable, so this checks its Host only if the two
 connectors use the same address.
+
+## Deleting from Jellyfin
+
+A Jellyfin installed from a distro package runs as its own `jellyfin` user. Everything in the
+libraries is owned by `PUID:PGID` from `.env` and created `755`/`644`. Jellyfin can read it, but
+**Delete media** in the web UI fails with `UnauthorizedAccessException: Access to the path … is
+denied`. Removing a file or folder needs write permission on the folder that holds it, and the
+`jellyfin` user has none. Nothing is removed, from disk or from the library.
+
+Grant the `jellyfin` user write access to the two library trees only, with a default ACL so that
+folders Sonarr and Radarr create later inherit it:
+
+```bash
+MEDIA_ROOT=/your/media/root    # the value from .env
+PUID=1000                      # the value from .env
+for lib in "$MEDIA_ROOT/complete/tv" "$MEDIA_ROOT/complete/movies"; do
+  sudo setfacl -R -m u:jellyfin:rwX "$lib"
+  sudo find "$lib" -type d -exec setfacl -m d:u:jellyfin:rwx,u:"$PUID":rwx,d:u:"$PUID":rwx {} +
+done
+```
+
+The `$PUID` entries cover the other direction. Jellyfin saves downloaded subtitles next to the
+media. Any folder *it* creates would be owned by `jellyfin` and read-only to the containers, and
+Sonarr or Radarr could then no longer upgrade or remove that title. On a test install, both
+directions were checked with folders created from inside the radarr container and a
+same-filesystem move, as an import does. A Delete media from the web UI then returned 204 and
+removed the movie's folder from disk.
+
+Why ACLs rather than groups:
+
+- **No Jellyfin restart.** A new group membership only takes effect after one.
+- **Nothing wider than the two libraries.** Adding `jellyfin` to the `PUID` user's group would
+  reach everything that group can already write, and that is often the whole home directory.
+- **Nothing to change in the containers.** The default ACL overrides their `022` umask for new
+  folders. The moved file itself keeps `644` and no ACL. That is fine: deleting it depends only on
+  its folder.
+
+Three ways to lose it:
+
+- **Sonarr/Radarr "Set Permissions"** (Settings > Media Management, `setPermissionsLinux`) chmods
+  every imported folder. `755` there caps the ACL mask at `r-x`, and deletion breaks again, silently.
+  Leave it off.
+- **Copying the libraries to a new disk** keeps the ACLs only with `cp -a`, `rsync -A` or
+  `tar --acls`. Otherwise run the commands above again. Check any folder with `getfacl`.
+- **A new library root** needs the same commands.
+
+Once Jellyfin can delete, also set **Unmonitor Deleted Movies** (Radarr) and **Unmonitor Deleted
+Episodes** (Sonarr) under Settings > Media Management. Otherwise a title deleted in Jellyfin stays
+monitored and missing. The arr can grab it again as soon as a matching release appears in RSS. If
+[stack watch](stack-watch.md) is installed, that title will also be reported as a stalled request.
 
 ## Reaching a Jellyfin that is not in this stack
 
