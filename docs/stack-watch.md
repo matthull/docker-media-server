@@ -35,11 +35,16 @@ new account.
 - **Problems** are a Compose service that is missing, exited, restarting or unhealthy; Jellyfin's
   `/health` not saying `Healthy`; less than `DISK_FREE_MIN` free where the library or the downloads
   live; Docker not answering; or a Compose file that can't be read. While Docker isn't answering,
-  services keep the state they last had rather than being counted as recovered.
+  services keep the state they last had rather than being counted as recovered. Only containers
+  Compose created count: a `docker run` of an image Compose built carries the project's labels, but
+  not the ones Compose puts on its own containers, so it can't stand in for a stopped service.
 - **The Seerr patch problem** reads `/app/dist/lib/downloadtracker.js` out of the running `seerr`
-  container (`docker exec`, 5s timeout) and says `seerr: running without its download-tracker patch`
-  if `refreshMonitoredDownloads` is in it. A read that fails, or a file with no `getQueue` call in it,
-  is its own problem, since the patch is an absence and an empty file has that too. It is only asked
+  container (`docker exec` by the Id of the container the service check found running, 5s timeout)
+  and says `seerr: running without its download-tracker patch` if `refreshMonitoredDownloads` is in
+  it. A read that fails, or a file with no `getQueue` call in it, is its own problem, since the patch
+  is an absence and an empty file has that too. Once Seerr has been seen unpatched, such a read keeps
+  the "running without" wording rather than changing it, so a timed-out read doesn't cost two High
+  updates; it still counts as a sighting, so only a read that finds the patch clears it. It is only asked
   when the Compose project has a `seerr` service that isn't already reported as stopped or unhealthy —
   one problem, not two, for a stopped container — and while that, or Docker being down, stops it being
   asked, it keeps its last state instead of being counted as fixed.
@@ -387,7 +392,7 @@ Run these from the repo root, one step at a time.
     sys.path.insert(0, "monitoring")
     import stack_watch as sw
     def run(argv, **kw):
-        if argv[:3] == ["docker", "exec", sw.SEERR_CONTAINER]:
+        if argv[:2] == ["docker", "exec"]:  # the only exec is the tracker read, by container Id
             argv = ["docker", "exec", "seerr-negctl", *argv[3:]]
         return sw.run_cmd(argv, **kw)
     sys.exit(sw.main(["check", "--test"], environ=dict(os.environ, HEARTBEAT_GRACE="off"), run=run))

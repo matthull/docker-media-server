@@ -405,7 +405,8 @@ the build silently (exit 0, no warning) and keep the old image, which leaves `se
 with everything reporting healthy, and nothing detects that. An *unpatched* Seerr is detected:
 Seerr's healthcheck passes identically without the patch, so `monitoring/stack_watch.py` reads
 `downloadtracker.js` out of the running container and alerts if the call is back (key `seerr:patch`).
-Keep its `SEERR_TRACKER` and the compose `container_name` in step with the build; a test ties them.
+It reads the container by the Id the service check found, not by `container_name`. Keep its
+`SEERR_SERVICE` and `SEERR_TRACKER` in step with the compose service and the build; a test ties them.
 
 `prowlarr` is deliberately on a `-nightly` tag — moving to stable is a **downgrade across a database
 migration**, which Prowlarr does not support and which needs a restore from

@@ -619,10 +619,11 @@ BLINDING_PROBLEMS = {"docker", "compose"}  # while either is up, services' state
 
 # Seerr is built, not pulled, so that its download tracker stops issuing an arr write that freezes the
 # progress bar (images/seerr/README.md). Its healthcheck passes identically without that patch, so the
-# patch is asserted by reading the file the build edits. The service, and its container_name.
-SEERR_CONTAINER = "seerr"
+# patch is asserted by reading the file the build edits, in the container the health check found.
+SEERR_SERVICE = "seerr"
 SEERR_TRACKER = "/app/dist/lib/downloadtracker.js"  # patch-downloadtracker.sh's target
 SEERR_PATCH = "seerr:patch"
+SEERR_UNPATCHED = "seerr: running without its download-tracker patch (see images/seerr/README.md)"
 # The read takes ~0.2s. run_cmd's 60 would spend 55s more of the run's time budget on it.
 SEERR_EXEC_TIMEOUT = 5
 
@@ -643,14 +644,17 @@ def stack_problems(stack_dir: Path, run: Run) -> dict[str, str]:
         return {"docker": "docker: not responding (details in the journal)"}
     problems = container_problems(sorted(config["services"]), containers)
     # A Seerr that isn't running can't be read, and is already the problem being reported.
-    if SEERR_CONTAINER in config["services"] and f"service:{SEERR_CONTAINER}" not in problems:
-        problem = seerr_patch_problem(run)
+    if SEERR_SERVICE in config["services"] and f"service:{SEERR_SERVICE}" not in problems:
+        # By Id, so the container read is one container_problems just judged running, found by the
+        # same Compose label rather than trusting that nothing else answers to the name.
+        running = [c["Id"] for c in service_containers(containers).get(SEERR_SERVICE, []) if is_up(c["State"])]
+        problem = seerr_patch_problem(run, running[0])
         if problem:
             problems[SEERR_PATCH] = problem
     return problems
 
 
-def seerr_patch_problem(run: Run) -> str | None:
+def seerr_patch_problem(run: Run, container_id: str) -> str | None:
     """Whether the running Seerr still lacks the refreshMonitoredDownloads call its build deletes.
 
     The file is read whole and searched here rather than with `grep -c`, which exits 1 precisely when
@@ -658,7 +662,7 @@ def seerr_patch_problem(run: Run) -> str | None:
     The patch is an absence, so the getQueue calls it leaves in place are what show this is the
     tracker at all and not an empty or unrelated file."""
     try:
-        source = run(["docker", "exec", SEERR_CONTAINER, "cat", SEERR_TRACKER], timeout=SEERR_EXEC_TIMEOUT)
+        source = run(["docker", "exec", container_id, "cat", SEERR_TRACKER], timeout=SEERR_EXEC_TIMEOUT)
     except (*COMMAND_ERRORS, UnicodeDecodeError) as exc:  # run_cmd decodes stdout as text
         print(f"seerr patch check failed: {exc}", file=sys.stderr)
         return "seerr: can't check its download-tracker patch (details in the journal)"
@@ -667,26 +671,38 @@ def seerr_patch_problem(run: Run) -> str | None:
               file=sys.stderr)
         return "seerr: can't recognise its download tracker, so the patch is unchecked"
     if "refreshMonitoredDownloads" in source:
-        return "seerr: running without its download-tracker patch (see images/seerr/README.md)"
+        return SEERR_UNPATCHED
     return None
 
 
-def container_problems(services: list[str], containers: list[dict]) -> dict[str, str]:
-    states: dict[str, list[dict]] = {}
+def service_containers(containers: list[dict]) -> dict[str, list[dict]]:
+    """The project's containers by Compose service, as Compose runs them.
+
+    Compose labels every container it creates oneoff True (`docker compose run`) or False. Nothing
+    else sets it, and something else does carry the project label: Compose stamps project and
+    service on the image it builds, so `docker run docker-media-server-seerr` is listed too."""
+    found: dict[str, list[dict]] = {}
     for container in containers:
         labels = container["Config"]["Labels"] or {}
-        if labels.get("com.docker.compose.oneoff") == "True":
+        if labels.get("com.docker.compose.oneoff") != "False":
             continue
-        states.setdefault(labels.get("com.docker.compose.service"), []).append(container["State"])
+        found.setdefault(labels.get("com.docker.compose.service"), []).append(container)
+    return found
+
+
+def is_up(state: dict) -> bool:
+    return state["Status"] == "running" and (state.get("Health") or {}).get("Status") != "unhealthy"
+
+
+def container_problems(services: list[str], containers: list[dict]) -> dict[str, str]:
+    by_service = service_containers(containers)
     problems = {}
     for service in services:
-        found = states.get(service)
+        found = [c["State"] for c in by_service.get(service, [])]
         if not found:
             problems[f"service:{service}"] = f"{service}: no container"
             continue
-        healthy = [s for s in found if s["Status"] == "running"
-                   and (s.get("Health") or {}).get("Status") != "unhealthy"]
-        if healthy:
+        if any(map(is_up, found)):
             continue
         state = found[0]
         if state["Status"] == "running":
@@ -1128,9 +1144,17 @@ def run_check(watch: Watch, state: dict) -> None:
             # Docker can't say how the services are, so keep what it last said rather than read its
             # silence as recovery.
             tracked |= {k: v for k, v in previous.items() if k.startswith("service:") or k == SEERR_PATCH}
-        elif f"service:{SEERR_CONTAINER}" in problems and SEERR_PATCH in previous:
+        elif f"service:{SEERR_SERVICE}" in problems and SEERR_PATCH in previous:
             # Nor is a stopped Seerr evidence that it has been rebuilt.
             tracked[SEERR_PATCH] = previous[SEERR_PATCH]
+        patch = tracked.get(SEERR_PATCH)
+        if patch and patch["count"] > 1 and previous[SEERR_PATCH]["description"] == SEERR_UNPATCHED:
+            # Once seen unpatched, a read that fails or finds no tracker says nothing new, and
+            # publish_stack counts any reworded problem as worse: a timed-out exec during a standing
+            # alert would go out as "can't check", then "running without" again, both High and both
+            # through the hour's spacing. It stays one key so recovery still has to be read, never
+            # inferred from a failed read.
+            patch["description"] = SEERR_UNPATCHED
         # State from before the stack record: treat what was alerted then as already shown. Dated
         # now, because when it actually went out is unknowable here and STACK_REPEAT would otherwise
         # re-send every old alert on the first run after an upgrade — but only when there is

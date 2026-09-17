@@ -133,14 +133,17 @@ def paged(records):
     return {"page": 1, "pageSize": 250, "totalRecords": len(records), "records": records}
 
 
-def container(service, status="running", health=None, exit_code=0, oneoff=False):
+def container(service, status="running", health=None, exit_code=0, oneoff=False, id=None, by_hand=False):
+    """`by_hand` is a `docker run` of an image Compose built: Compose stamps the project and service
+    labels on the image, so the container has those, but not the ones Compose puts on containers."""
     state = {"Status": status, "ExitCode": exit_code}
     if health:
         state["Health"] = {"Status": health}
-    labels = {"com.docker.compose.service": service}
-    if oneoff:
-        labels["com.docker.compose.oneoff"] = "True"
-    return {"Config": {"Labels": labels}, "State": state}
+    labels = {"com.docker.compose.project": "proj", "com.docker.compose.service": service}
+    if not by_hand:
+        labels["com.docker.compose.oneoff"] = "True" if oneoff else "False"
+    # Never the service name, so a check that reaches a container by name can't pass by accident.
+    return {"Id": id or f"{service}-{status}-0123abcd", "Config": {"Labels": labels}, "State": state}
 
 
 COMPOSE_CONFIG = json.dumps({"name": "proj", "services": {"sonarr": {}, "radarr": {}}})
@@ -505,6 +508,12 @@ class ContainerProblemsTest(unittest.TestCase):
             "service:prowlarr": "prowlarr: no container",
         })
 
+    def test_a_container_run_by_hand_from_the_built_image_is_not_the_service(self):
+        """`docker run docker-media-server-seerr` carries the image's Compose labels, so the project
+        filter lists it. It is not what Compose runs, and must not stand in for a missing service."""
+        self.assertEqual(sw.container_problems(["seerr"], [container("seerr", by_hand=True)]),
+                         {"service:seerr": "seerr: no container"})
+
     def test_one_good_container_is_enough(self):
         containers = [container("sonarr", "exited"), container("sonarr", health="healthy")]
         self.assertEqual(sw.container_problems(["sonarr"], containers), {})
@@ -671,19 +680,35 @@ class SeerrPatchTest(unittest.TestCase):
 
     def test_reads_the_file_the_build_patches_with_a_short_timeout(self):
         run = seerr_stack(tracker=PATCHED_TRACKER)
-        self.assertIsNone(sw.seerr_patch_problem(run))
-        self.assertEqual(run.calls, [(["docker", "exec", "seerr", "cat", "/app/dist/lib/downloadtracker.js"],
+        self.assertIsNone(sw.seerr_patch_problem(run, "c0ffee"))
+        self.assertEqual(run.calls, [(["docker", "exec", "c0ffee", "cat", "/app/dist/lib/downloadtracker.js"],
                                       {"timeout": sw.SEERR_EXEC_TIMEOUT})])
 
+    def test_reads_the_container_the_health_check_found_not_one_named_seerr(self):
+        """The health check finds the service's containers by Compose label, whatever they are
+        called. Reading by container_name would read a different container, or none, as soon as
+        that name changed or an unrelated container took it."""
+        run = seerr_stack(container("sonarr"), container("seerr", id="4f1e"))
+        self.assertEqual(sw.stack_problems(Path("/stack"), run), {})
+        self.assertEqual(execs(run), [["docker", "exec", "4f1e", "cat", sw.SEERR_TRACKER]])
+
+    def test_reads_the_running_container_when_the_service_has_several(self):
+        for other in (container("seerr", "exited", id="old"), container("seerr", health="unhealthy", id="sick"),
+                      container("seerr", oneoff=True, id="oneoff"), container("seerr", by_hand=True, id="negctl")):
+            with self.subTest(other=other["Id"]):
+                run = seerr_stack(container("sonarr"), other, container("seerr", id="live"), other)
+                self.assertEqual(sw.stack_problems(Path("/stack"), run), {})
+                self.assertEqual(execs(run), [["docker", "exec", "live", "cat", sw.SEERR_TRACKER]])
+
     def test_an_unpatched_tracker_is_a_problem(self):
-        self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=UNPATCHED_TRACKER)),
+        self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=UNPATCHED_TRACKER), "c0ffee"),
                          "seerr: running without its download-tracker patch (see images/seerr/README.md)")
 
     def test_a_file_that_is_not_the_tracker_does_not_pass_for_a_patched_one(self):
         """The patch is an absence, and an absence is what an empty or unrelated file has too."""
         for source in ("", "module.exports = {};\n"):
             with self.subTest(source=source), contextlib.redirect_stderr(io.StringIO()) as log:
-                self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=source)),
+                self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=source), "c0ffee"),
                                  "seerr: can't recognise its download tracker, so the patch is unchecked")
                 self.assertIn("getQueue", log.getvalue())
 
@@ -696,7 +721,7 @@ class SeerrPatchTest(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__):
                 with contextlib.redirect_stderr(io.StringIO()) as log:
-                    problem = sw.seerr_patch_problem(seerr_stack(tracker=failure))
+                    problem = sw.seerr_patch_problem(seerr_stack(tracker=failure), "c0ffee")
                 self.assertEqual(problem, "seerr: can't check its download-tracker patch (details in the journal)")
                 self.assertIn("SENTINEL", log.getvalue())  # the journal gets the reason
 
@@ -728,7 +753,7 @@ class SeerrPatchTest(unittest.TestCase):
         """run_cmd decodes as text, and UnicodeDecodeError is a ValueError, not a COMMAND_ERROR."""
         garbled = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=garbled)),
+            self.assertEqual(sw.seerr_patch_problem(seerr_stack(tracker=garbled), "c0ffee"),
                              "seerr: can't check its download-tracker patch (details in the journal)")
 
     def test_a_stack_without_seerr_is_not_asked_about_it(self):
@@ -738,13 +763,12 @@ class SeerrPatchTest(unittest.TestCase):
         self.assertEqual(execs(run), [])
 
     def test_the_names_match_the_compose_file_and_the_patch_script(self):
-        """The check reaches the container by container_name and reads the path the build edits; if
-        either drifts, every run reports "can't check" rather than going quiet, but it should never
-        get that far."""
+        """The check is asked only when the Compose project has this service, and reads the path the
+        build edits. A renamed service would skip it silently; a moved path reports "can't check" on
+        every run. Neither should get that far."""
         repo = Path(sw.__file__).resolve().parent.parent
         compose = (repo / "docker-compose.yml").read_text()
-        service = re.search(r"^  seerr:\n((?:    .*\n|\s*\n)+)", compose, re.MULTILINE)[1]
-        self.assertIn(f"container_name: {sw.SEERR_CONTAINER}\n", service)
+        self.assertRegex(compose, rf"(?m)^  {sw.SEERR_SERVICE}:\n")
         script = (repo / "images" / "seerr" / "patch-downloadtracker.sh").read_text()
         self.assertEqual(re.search(r"^target=(\S+)$", script, re.MULTILINE)[1], sw.SEERR_TRACKER)
 
@@ -1716,6 +1740,55 @@ class RunCheckTest(unittest.TestCase):
             self.check(state, unpatched, minutes * MIN)
         self.assertTrue(state["tracked"]["seerr:patch"]["alerted"])
         return state
+
+    def test_a_failed_read_does_not_reword_a_standing_unpatched_alert(self):
+        """A read that fails says nothing new about a Seerr already seen unpatched. Rewording the
+        alert to "can't check" and back counted as two worsenings: two extra High notifications that
+        skip the hour's spacing and spend two of the day's twelve."""
+        state = self.alerted_unpatched()
+        unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
+        sent = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            for i, failure in enumerate((subprocess.TimeoutExpired(["docker"], 5), "", RuntimeError("gone"))):
+                unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=failure)
+                start = 30 + 75 * i
+                for minutes in (start, start + 15, start + 30):
+                    sent += self.check(state, unreadable, minutes * MIN)
+                for minutes in (start + 45, start + 60):
+                    sent += self.check(state, unpatched, minutes * MIN)
+                self.assertEqual(state["tracked"]["seerr:patch"]["description"], self.UNPATCHED)
+        self.assertEqual(sent, [])
+        self.assertTrue(state["tracked"]["seerr:patch"]["alerted"])
+
+    def test_a_seerr_seen_unpatched_once_stays_worded_so_when_it_becomes_unreadable(self):
+        unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        state = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.check(state, unpatched, 0 * MIN)
+            [sent] = self.check(state, unreadable, 15 * MIN)
+        self.assertEqual(sent["message"], f"• {self.UNPATCHED}")
+
+    def test_an_unreadable_seerr_not_seen_unpatched_lately_says_it_cannot_check(self):
+        """The wording is kept only through an unbroken run of sightings. After a gap, or once the
+        patch has been cleared, a failed read is what it is."""
+        unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
+        patched = seerr_stack(container("sonarr"), container("seerr"))
+        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
+        cant = "• seerr: can't check its download-tracker patch (details in the journal)"
+        with contextlib.redirect_stderr(io.StringIO()):
+            state = {}
+            self.check(state, unpatched, 0 * MIN)
+            self.check(state, unreadable, 60 * MIN)  # stale: the sighting at 0 no longer counts
+            [sent] = self.check(state, unreadable, 75 * MIN)
+            self.assertEqual(sent["message"], cant)
+
+            state = self.alerted_unpatched()
+            sent = []
+            for minutes, run in ((30, patched), (45, patched), (75, patched), (90, unreadable), (105, unreadable)):
+                sent += self.check(state, run, minutes * MIN)
+            self.assertEqual([m["message"] for m in sent],
+                             [f"Everything that was down is back up.\n\nCleared:\n• {self.UNPATCHED}", cant])
 
     def test_the_patch_is_not_called_fixed_while_docker_cannot_be_asked(self):
         """Docker being down says nothing about what Seerr is running. Reading its silence as

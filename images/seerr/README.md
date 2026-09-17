@@ -162,8 +162,10 @@ container. `monitoring/stack_watch.py` does, every 15 minutes: it reads
 `/app/dist/lib/downloadtracker.js` out of `seerr` and alerts `seerr: running without its
 download-tracker patch` if `refreshMonitoredDownloads` is anywhere in it. That is the backstop for the
 ways around the build rather than through it — an `image:` key put back, or an override pointing at
-upstream. (A `seerr` started by hand with `docker run` has no Compose labels, so it is reported as
-`seerr: no container` instead, and is not read.) It also alerts if the file can't be read, or has no `getQueue`
+upstream. (A container started by hand with `docker run` is never the one read, and does not count as
+the service. That includes one run from this built image, which does carry its project and service
+labels, because Compose stamps them on the image. A `seerr` with only such a container is reported as
+`seerr: no container`.) It also alerts if the file can't be read, or has no `getQueue`
 call (the patch is an absence, and an empty file has that too). It is skipped while `seerr` is
 already reported stopped or unhealthy, and keeps its last state then rather than calling the patch
 fixed. See [docs/stack-watch.md](../../docs/stack-watch.md).
