@@ -1850,8 +1850,13 @@ class RunCheckTest(unittest.TestCase):
             self.assertIsNot(state["tracked"]["seerr:patch"], before)
 
     def test_an_unreadable_seerr_not_seen_unpatched_lately_says_it_cannot_check(self):
-        """The wording is kept only through an unbroken run of sightings. After a gap, or once the
-        patch has been cleared, a failed read is what it is."""
+        """A failed read is what it is until an unpatched alert has actually been published. Below,
+        first because the gap makes the sighting stale so nothing is ever alerted, then because the
+        patch was found and the alert cleared.
+
+        Not because of the gap itself: `advance` short-circuits the staleness check on `alerted`, so
+        once the alert is out, silence of any length keeps the pin. That is deliberate — an alert
+        nobody has cleared is still standing, however long ago it went out."""
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
         patched = seerr_stack(container("sonarr"), container("seerr"))
         unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))

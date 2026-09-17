@@ -47,8 +47,10 @@ new account.
   updates. Before that first alert it says what it is: "seen unpatched once, then couldn't re-check"
   is a different and more urgent fault than an unpatched Seerr — Docker may not be able to get into
   the container at all — and the wording is pinned to protect a message already sent, not to settle a
-  question still open. It still counts as a sighting, so only a read that finds the patch clears it.
-  It is only asked
+  question still open. It still counts as a sighting, so only a read that finds the patch clears it —
+  and because a sighting resets the absence damping, a Seerr that really was rebuilt and then went
+  unreadable keeps reporting as unpatched for as long as the reads keep failing. That is the trade:
+  the alternative is reading a failed exec as recovery. It is only asked
   when the Compose project has a `seerr` service that isn't already reported as stopped or unhealthy —
   one problem, not two, for a stopped container — and while that, or Docker being down, stops it being
   asked, it keeps its last state instead of being counted as fixed.

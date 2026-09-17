@@ -146,12 +146,19 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     ("SP28", 'state.setdefault("stack", {"shown": inherited})', 'state.setdefault("stack", {"shown": {}})',
      "a state file older than the stack record forgets what it alerted, so the first run after an "
      "upgrade rewords a standing unpatched alert"),
+    # SP26 and SP27 are the table's two equivalent mutants, kept knowingly. Nothing observable
+    # changes: the only write through the alias sets a field to the value it already holds. They are
+    # killed by an assertIsNot, so they pin the structure — no entry shared between `tracked` and
+    # the state `previous` still points at — rather than an output. Read them as "this stays a copy",
+    # and if a future edit ever writes a differing value here, that is when they start breaking a
+    # behaviour. Everything else in this file earns its place by changing what goes out.
     ("SP26", "tracked[SEERR_PATCH] = dict(previous[SEERR_PATCH])",
      "tracked[SEERR_PATCH] = previous[SEERR_PATCH]",
-     "a stopped Seerr carries the entry forward by reference, so writing to it edits the state the "
-     "run is still reading"),
+     "a stopped Seerr carries the entry forward by reference, so a later write through it would edit "
+     "state the run has already read (equivalent today; pins the copy)"),
     ("SP27", 'tracked |= {k: dict(v) for k, v in previous.items()', 'tracked |= {k: v for k, v in previous.items()',
-     "Docker being down carries entries forward by reference, same trap"),
+     "Docker being down carries entries forward by reference, same trap (equivalent today; pins the "
+     "copy)"),
     ("SP13", 'SEERR_TRACKER = "/app/dist/lib/downloadtracker.js"',
      'SEERR_TRACKER = "/app/dist/lib/downloadTracker.js"',
      "the check reads a path the build never edits"),
