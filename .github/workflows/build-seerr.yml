@@ -3,9 +3,10 @@
 # images/seerr/patch-downloadtracker.sh fails the build when it cannot patch -- by design.
 # On a warm host that only leaves the old image serving, but on a cold `docker compose up -d`
 # (reboot, migration, fresh clone, `down` then `up -d`) a failed build aborts the WHOLE
-# invocation and no service in the stack starts. This workflow moves that failure to the
-# pull request, where a red check stops a merge instead of an outage. See
-# images/seerr/README.md, "Why it is a Dockerfile".
+# invocation and no service in the stack starts. This workflow surfaces that failure as a red
+# check on the pull request (or, for a direct push, on main right after it lands) instead of
+# at the next cold start. Nothing enforces the check -- there is no branch protection. See
+# images/seerr/README.md, "A failed build on a cold start takes the whole stack down".
 name: "Build seerr image"
 on:
   pull_request:
