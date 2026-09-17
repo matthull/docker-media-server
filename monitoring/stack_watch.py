@@ -98,8 +98,8 @@ SIZE_UNITS = {"M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
 # goes out: the topic is public and the paths name the user's home directory.
 DISK_ROLES = (("MEDIA_ROOT", "library", None), ("SABNZBD_TEMP", "downloads", "/tmp/sabnzbd-temp"))
 # os.statvfs and os.stat have no timeout of their own and block uninterruptibly on a spun-down,
-# failing or stale mount; run_cmd has 60s and http_request 20s. Two roles at this figure still leave
-# the unit far inside its TimeoutStartSec=5min.
+# failing or stale mount. Every timeout here is spent inside the unit's TimeoutStartSec, and
+# RunTimeBudgetTest adds them all up: raise one or add a call, and that test says whether it still fits.
 DISK_READ_TIMEOUT = 20
 # Default DISK_FREE_MIN. SABnzbd pauses downloading at download_free (50G as shipped here) and says
 # nothing anyone sees, so requests stop arriving silently; the alert has to come well before that.
@@ -239,11 +239,48 @@ def sequence_safe(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", text)
 
 
+def give_up_after(seconds: float, what: str, call: Callable[[], object]):
+    """call()'s result or exception, or TimeoutError once `seconds` have passed.
+
+    call() runs on a thread that is abandoned, not cancelled, when time runs out: a thread stuck in a
+    syscall can't be cancelled. That is safe only because it is a daemon thread, which doesn't hold
+    up the interpreter's exit; a non-daemon one is joined at shutdown, which is the very overrun
+    this exists to prevent. TimeoutError is an OSError, so it arrives wherever the call's own
+    failures are already handled. `what` goes into its message, so it must never name a path or a
+    URL: the topic is public, and both can carry it or the user's home directory."""
+    outcome: dict = {}
+
+    def attempt() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if "error" in outcome:
+        raise outcome["error"]
+    if "value" not in outcome:
+        raise TimeoutError(f"{what} took longer than {seconds}s")
+    return outcome["value"]
+
+
 def http_request(method: str, url: str, headers: dict | None = None, data: bytes | None = None,
                  timeout: float = 20) -> str:
+    """The body of the reply, in at most `timeout` seconds.
+
+    urlopen's own timeout is not that: it bounds each socket operation, so a reply trickling in
+    (measured: 3s under a 0.5s timeout) or a name slow to resolve runs on past it. The unit's time
+    limit is checked against the sum of these timeouts (RunTimeBudgetTest), so each has to be a real
+    ceiling. A request given up on may still reach the server before the process exits; that was
+    already possible when it was the reply, not the request, that timed out."""
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode()
+
+    def fetch() -> str:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode()
+    return give_up_after(timeout, "the request", fetch)
 
 
 def run_cmd(argv: list, timeout: float = 60) -> str:
@@ -584,7 +621,7 @@ BLINDING_PROBLEMS = {"docker", "compose"}  # while either is up, services' state
 SEERR_CONTAINER = "seerr"
 SEERR_TRACKER = "/app/dist/lib/downloadtracker.js"  # patch-downloadtracker.sh's target
 SEERR_PATCH = "seerr:patch"
-# The read takes ~0.2s. run_cmd's 60 would push a worst-case run past the unit's TimeoutStartSec.
+# The read takes ~0.2s. run_cmd's 60 would spend 55s more of the run's time budget on it.
 SEERR_EXEC_TIMEOUT = 5
 
 
@@ -708,38 +745,21 @@ def filesystem_free(path: str, timeout: float = DISK_READ_TIMEOUT,
     """(which filesystem, bytes this user may still write, its total size) for the filesystem
     holding path.
 
-    The read happens on a thread that is abandoned if it takes longer than `timeout`, because the
-    calls it makes have no timeout of their own and a spun-down, failing or stale network mount
-    blocks them uninterruptibly. Abandoned rather than cancelled — a thread stuck in a syscall can't
-    be cancelled — which is safe because it is a daemon thread and so doesn't hold up the
-    interpreter's exit. Giving up raises TimeoutError, an OSError, so it arrives at disk_problems'
+    The read is given up on after `timeout` (give_up_after), because the calls it makes have no
+    timeout of their own and a spun-down, failing or stale network mount blocks them
+    uninterruptibly. Giving up raises TimeoutError, an OSError, so it arrives at disk_problems'
     unreadable-path branch as any other unreadable path does.
 
     Neither obvious alternative works. `subprocess.run(timeout=)` is not safer: on timeout it calls
-    kill() and then communicate() with no timeout of its own, and a process wedged in D-state does
-    not die on SIGKILL, so it can block in exactly the same way. `ThreadPoolExecutor` is worse — its
+    kill() and then, on POSIX, wait() with no timeout of its own, and a process wedged in D-state
+    does not die on SIGKILL, so it can block in exactly the same way. `ThreadPoolExecutor` is worse — its
     workers are non-daemon and its atexit hook joins them, which is the hang this avoids.
 
     Without this the whole run is lost rather than one path: the disk check runs after the container
     and Jellyfin checks, so TimeoutStartSec would SIGTERM the unit with their results gathered but
     unsaved and no failure recorded, and nothing would be heard until the heartbeat said the host
     was asleep or offline. Migration-relevant: today's library is a local ext4 partition."""
-    outcome: dict = {}
-
-    def attempt() -> None:
-        try:
-            outcome["value"] = read(path)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
-            outcome["error"] = exc
-
-    worker = threading.Thread(target=attempt, daemon=True)
-    worker.start()
-    worker.join(timeout)
-    if "error" in outcome:
-        raise outcome["error"]
-    if "value" not in outcome:
-        raise TimeoutError(f"reading free space took longer than {timeout}s")
-    return outcome["value"]
+    return give_up_after(timeout, "reading free space", lambda: read(path))
 
 
 def disk_problems(cfg: dict, minimum: int, floors: dict, free_space=None,

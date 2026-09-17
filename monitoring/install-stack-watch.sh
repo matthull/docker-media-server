@@ -66,7 +66,7 @@ Type=oneshot
 ExecStart="$PYTHON" "$WATCH" $3
 # The user manager's PATH is minimal; make sure docker is on it.
 Environment=PATH=$(dirname "$DOCKER"):/usr/local/bin:/usr/bin:/bin
-TimeoutStartSec=5min
+TimeoutStartSec=10min
 EOF
 }
 

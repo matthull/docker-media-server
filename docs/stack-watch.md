@@ -229,6 +229,25 @@ To remove it: `./monitoring/install-stack-watch.sh --uninstall`.
 
 Logs are in `journalctl --user -u 'media-stack-*'`, and state is in `~/.local/state/media-stack-watch/`.
 
+**How long a run can take.** Both units have `TimeoutStartSec=10min`. systemd kills a run that
+outlasts that, and nothing the run decided is saved. Every call a run makes has a hard limit:
+- Docker commands: 60 seconds, except the read of Seerr's tracker (5).
+- Jellyfin: 10 seconds.
+- Each free-space read: 20 seconds.
+- Each ntfy or *arr request: 20 seconds, whether it is still resolving the name or the reply is
+  still trickling in.
+
+`RunTimeBudgetTest` adds these limits up for every state a run can start from and every call it can
+fail at. The longest possible run comes to:
+- a check at 315 seconds;
+- a stalled run at 120 seconds, plus 20 for every page of an *arr's queue or wanted list beyond the
+  first (250 titles a page).
+
+The test fails when a new check or a raised timeout leaves less than 30 seconds of margin. The limit
+also has to stay under the 15-minute check interval, because systemd skips a tick while the previous
+run is still going. An install made before the limit was raised from 5 minutes keeps the old limit
+until the installer is run again.
+
 ## Testing
 
 Force each alert once after installing. `--test` prefixes titles with `TEST:`, uses its own state file and
@@ -422,6 +441,11 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
 - **Seerr on a stale base.** `docker compose up -d --pull always` or `--no-build` keeps running the
   last built image, which still has the patch, so the Seerr check passes. It proves the patch is
   there, not that the image is current. See [images/seerr](../images/seerr/README.md).
+- **A Docker command stuck in uninterruptible sleep.** When a command times out it is killed and
+  then waited for, but a process in D-state does not die. Waiting for it can outlast the unit's time
+  limit, and then systemd kills the run with nothing it decided saved. The next check starts again
+  from the state before. Free-space reads, the other calls that can block this way, are abandoned
+  instead.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
 - **An inferred fallback that becomes too small for the threshold while it is already a problem.**

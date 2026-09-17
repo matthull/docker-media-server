@@ -13,7 +13,8 @@ DISK_FREE_MIN (which is what .env.example ships) silently turning the check off,
 meaning off. The test written for the first of those then found a third bug, a whitespace-only value
 bypassing the default.
 
-Add an entry whenever you add behaviour worth keeping. The cost is one suite run each (~0.1s).
+Add an entry whenever you add behaviour worth keeping. The cost is one suite run each (~2s; B2, which
+never gives up on a hung call, waits out every hung fake and takes about two minutes).
 """
 from __future__ import annotations
 
@@ -98,7 +99,7 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      '        elif f"service:{SEERR_CONTAINER}" in problems:',
      "a stopped Seerr with no patch history raises KeyError and fails the whole run"),
     ("SP6", "], timeout=SEERR_EXEC_TIMEOUT)", "])",
-     "the read waits run_cmd's 60s, pushing a worst-case run past TimeoutStartSec"),
+     "the read waits run_cmd's 60s, 55s of the run's time budget the docs don't account for"),
     ("SP7", "SEERR_EXEC_TIMEOUT = 5", "SEERR_EXEC_TIMEOUT = 60",
      "the same, by retuning the constant"),
     ("SP8", 'if SEERR_CONTAINER in config["services"] and f"service:{SEERR_CONTAINER}" not in problems:',
@@ -167,7 +168,18 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     # --- the abandoned read must not be able to hold up the interpreter's exit
     ("T4", "    worker = threading.Thread(target=attempt, daemon=True)",
      "    worker = threading.Thread(target=attempt, daemon=False)",
-     "a wedged read is joined at shutdown, which is the SIGTERM the timeout exists to prevent"),
+     "a wedged read or request is joined at shutdown, which is the SIGTERM the timeout exists to prevent"),
+    # --- every timeout the run's budget adds up has to be a ceiling, and the sum has to fit
+    ("B1", '    return give_up_after(timeout, "the request", fetch)', "    return fetch()",
+     "urlopen's per-operation timeout is trusted, so a trickling reply runs on past it"),
+    ("B2", "    worker.join(seconds)", "    worker.join()",
+     "nothing is ever given up on, so a hung read or request holds the run until systemd kills it"),
+    ("B3", '    return give_up_after(timeout, "the request", fetch)',
+     "    return give_up_after(timeout, url, fetch)",
+     "a request given up on quotes its URL, and the ntfy URL is the topic"),
+    ("B4", "def run_cmd(argv: list, timeout: float = 60) -> str:",
+     "def run_cmd(argv: list, timeout: float = 150) -> str:",
+     "a check can outlast the unit's TimeoutStartSec, and is killed with nothing saved"),
     ("T5", "DISK_READ_TIMEOUT = 20", "DISK_READ_TIMEOUT = 2000",
      "33 minutes for one path, well past the unit's TimeoutStartSec"),
     # --- a filesystem that can never satisfy the threshold, which Compose's fallback usually is
@@ -378,6 +390,9 @@ def main() -> int:
         (tree / "images" / "seerr").mkdir(parents=True)
         shutil.copy(REPO / "images" / "seerr" / "patch-downloadtracker.sh",
                     tree / "images" / "seerr" / "patch-downloadtracker.sh")
+        # And the run-time figures the docs quote have to be the ones the suite derives.
+        (tree / "docs").mkdir()
+        shutil.copy(REPO / "docs" / "stack-watch.md", tree / "docs" / "stack-watch.md")
         if not suite_passes(tree):
             print("The suite is already failing; fix that before reading anything into mutants.")
             return 1

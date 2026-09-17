@@ -1,6 +1,8 @@
 """Tests for stack_watch.py. Run: python3 -m unittest discover -s monitoring"""
 import contextlib
+import inspect
 import io
+import itertools
 import json
 import re
 import socket
@@ -228,11 +230,23 @@ class SizeTest(unittest.TestCase):
         self.assertEqual(sw.size(1024 ** 3 - 1, sw.MEASURED), "1024M")
 
 
+def unit_start_timeout():
+    """TimeoutStartSec of the units install-stack-watch.sh writes, in seconds."""
+    installer = Path(sw.__file__).with_name("install-stack-watch.sh").read_text()
+    [limit] = re.findall(r"^TimeoutStartSec=(\d+)min$", installer, re.MULTILINE)
+    return int(limit) * 60
+
+
 class ScheduleTest(unittest.TestCase):
     def test_check_timer_runs_every_check_interval(self):
         installer = Path(sw.__file__).with_name("install-stack-watch.sh").read_text()
         minutes = re.findall(r"^OnCalendar=\*:0/(\d+)$", installer, re.MULTILINE)
         self.assertEqual([timedelta(minutes=int(m)) for m in minutes], [sw.CHECK_INTERVAL])
+
+    def test_a_run_is_given_up_on_before_the_next_one_is_due(self):
+        """systemd does not start a oneshot that is still running, so a run allowed to outlast the
+        interval would silently swallow the next tick instead of failing."""
+        self.assertLess(unit_start_timeout(), sw.CHECK_INTERVAL.total_seconds())
 
 
 class StalledMoviesTest(unittest.TestCase):
@@ -494,6 +508,78 @@ class ContainerProblemsTest(unittest.TestCase):
     def test_one_good_container_is_enough(self):
         containers = [container("sonarr", "exited"), container("sonarr", health="healthy")]
         self.assertEqual(sw.container_problems(["sonarr"], containers), {})
+
+
+class HttpRequestTest(unittest.TestCase):
+    """urlopen's timeout bounds each socket operation, not the request: measured, a reply trickling in
+    a byte every 0.2s took 3.02s to arrive under timeout=0.5, and resolving the name has no timeout
+    at all. RunTimeBudgetTest adds up the timeouts every call is given, which is only a bound on the
+    run if each one really is a ceiling."""
+
+    def trickle(self, seconds_per_byte, size):
+        """A local server that answers with `size` bytes, one every `seconds_per_byte`. Returns its
+        URL; the server gives up quietly if nobody is still reading."""
+        server = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+
+        def serve():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(4096)
+                conn.sendall(f"HTTP/1.0 200 OK\r\nContent-Length: {size}\r\n\r\n".encode())
+                with contextlib.suppress(OSError):
+                    for _ in range(size):
+                        time.sleep(seconds_per_byte)
+                        conn.sendall(b"x")
+        threading.Thread(target=serve, daemon=True).start()
+        return f"http://127.0.0.1:{server.getsockname()[1]}/"
+
+    def test_a_reply_that_keeps_trickling_in_is_given_up_on_at_the_timeout(self):
+        url = self.trickle(0.1, 30)  # every read well inside the timeout; the whole reply 3s
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            sw.http_request("GET", url, timeout=0.5)
+        self.assertLess(time.monotonic() - began, 2)
+
+    def test_a_request_that_never_reaches_a_socket_is_given_up_on_too(self):
+        """Name resolution happens before any socket timeout applies."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        began = time.monotonic()
+        with unittest.mock.patch.object(sw.urllib.request, "urlopen", lambda *a, **k: release.wait(10)):
+            with self.assertRaises(TimeoutError):
+                sw.http_request("GET", "http://resolving.invalid/", timeout=0.2)
+        self.assertLess(time.monotonic() - began, 5)
+
+    def test_the_abandoned_request_does_not_hold_up_the_interpreters_exit(self):
+        """Otherwise the process outlives its own give-up by however long the request hangs, which
+        is the overrun the timeout exists to prevent."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        before = set(threading.enumerate())
+        with unittest.mock.patch.object(sw.urllib.request, "urlopen", lambda *a, **k: release.wait(10)):
+            with self.assertRaises(TimeoutError):
+                sw.http_request("GET", "http://resolving.invalid/", timeout=0.2)
+        [abandoned] = [t for t in threading.enumerate() if t not in before]
+        self.assertTrue(abandoned.daemon)
+
+    def test_an_answer_and_an_error_arrive_as_themselves(self):
+        url = self.trickle(0, 3)
+        self.assertEqual(sw.http_request("GET", url, timeout=5), "xxx")
+        refused = urllib.error.HTTPError("http://x", 401, "no", {}, None)
+        with unittest.mock.patch.object(sw.urllib.request, "urlopen", raises(refused)):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                sw.http_request("GET", "http://x/")
+        self.assertEqual(caught.exception.code, 401)  # Arr.get reads it
+
+    def test_the_give_up_does_not_quote_the_url(self):
+        """The ntfy URL carries the topic, and anyone who knows the topic can read and cancel on it."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with unittest.mock.patch.object(sw.urllib.request, "urlopen", lambda *a, **k: release.wait(10)):
+            with self.assertRaises(TimeoutError) as caught:
+                sw.http_request("POST", "https://ntfy.test/SENTINEL_TOPIC", timeout=0.2)
+        self.assertNotIn("SENTINEL", str(caught.exception))
 
 
 class JellyfinTest(unittest.TestCase):
@@ -962,21 +1048,6 @@ class DiskTest(unittest.TestCase):
             sw.filesystem_free("/lib", read=raises(OSError(2, "No such file or directory")))
         self.assertEqual(caught.exception.errno, 2)
         self.assertLess(time.monotonic() - began, 1)  # the name promises this; assert it
-
-    def test_the_disk_reads_fit_inside_the_units_start_timeout(self):
-        """The disk is read after the containers and Jellyfin, so its timeout is spent on top of
-        theirs, and overrunning TimeoutStartSec is the SIGTERM-without-saving-state this was written
-        to prevent. Ties the constants to the unit the installer writes, the way ScheduleTest ties
-        the cadence to the timer."""
-        installer = Path(sw.__file__).with_name("install-stack-watch.sh").read_text()
-        [limit] = re.findall(r"^TimeoutStartSec=(\d+)min$", installer, re.MULTILINE)
-        worst = (3 * 60  # docker compose config, docker ps, docker inspect, at run_cmd's timeout
-                 + sw.SEERR_EXEC_TIMEOUT  # reading Seerr's download tracker
-                 + 10  # jellyfin
-                 + len(sw.DISK_ROLES) * sw.DISK_READ_TIMEOUT
-                 + 3 * 20)  # the stack, heartbeat and failure ntfy publishes, at http_request's
-        self.assertLess(worst, int(limit) * 60,
-                        f"a worst-case check takes {worst}s against a {limit}min limit")
 
     def test_a_fallback_filesystem_too_small_for_the_threshold_is_not_watched(self):
         """Compose's fallback is usually /tmp, a tmpfs of a few gigabytes, and DISK_FREE_MIN is sized
@@ -2171,6 +2242,143 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self.main("check", "--dry-run", env=env, http=http, run=docker_down), 0)
         self.assertEqual(http.calls, [])
         self.assertFalse((self.dir / "check.json").exists())
+
+
+def default_timeout(function):
+    return inspect.signature(function).parameters["timeout"].default
+
+
+# Read before any test patches these names.
+HTTP_TIMEOUT = default_timeout(sw.http_request)
+RUN_TIMEOUT = default_timeout(sw.run_cmd)
+DISK_TIMEOUT = default_timeout(sw.filesystem_free)
+
+
+class RunTimeBudgetTest(unittest.TestCase):
+    """A run that outlives the unit's TimeoutStartSec is SIGTERMed with nothing it decided saved: no
+    alert recorded as shown, no heartbeat recorded as rescheduled, no failure counted. So the longest
+    a run can take has to fit inside it, with room for what no call is charged for.
+
+    This used to be a hand-written sum, and it was wrong: it counted three ntfy publishes where one
+    check can make four ("back online" and the reschedule, then "working again"), and nothing would
+    have told whoever added the next check that the sum no longer held. It is derived instead.
+    main() is driven through every combination of the state a run can start from and the one call
+    it fails at, and every external call is charged the whole timeout the code gives it, as if each
+    one hung until the last moment. A new check, a new publish or a raised timeout lands in the sum
+    without anyone having to remember it.
+
+    A charge is only a bound if the timeout is a ceiling; HttpRequestTest is what makes it one for
+    http_request. docs/stack-watch.md quotes the results, and is checked against them here."""
+
+    # Python starting, .env and state read and written, threads started: no call is charged for these.
+    OVERHEAD = 30
+    STALLED_PAGES = 1  # per list; each further page is one more HTTP_TIMEOUT, which the docs say
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.env = {"STACK_DIR": self.tmp.name, "STATE_DIR": self.tmp.name, "CONFIG_ROOT": self.tmp.name,
+                    "NTFY_TOPIC": "t", "NTFY_SERVER": "https://ntfy.test", "WATCH_HOSTNAME": "h",
+                    "JELLYFIN_URL": "http://jf", "MEDIA_ROOT": "/lib", "SABNZBD_TEMP": "/dl"}
+        for name in ("radarr", "sonarr"):
+            conf = self.dir / "config" / name
+            conf.mkdir(parents=True)
+            conf.joinpath("config.xml").write_text("<Port>1</Port><ApiKey>k</ApiKey>")
+
+    def drive(self, command, state, fail_at, env=None):
+        """Runs `command` once from `state` (a dict, or text for a file that isn't one), failing the
+        `fail_at`th external call. Returns (seconds charged, titles published, calls made)."""
+        charged, titles, unexpected = [], [], []
+        stack = seerr_stack(container("sonarr", "exited", exit_code=1), container("seerr"))
+
+        def charge(timeout, failure):
+            charged.append(timeout)
+            if len(charged) - 1 == fail_at:
+                raise failure
+
+        def http(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT):
+            charge(timeout, urllib.error.URLError("down"))
+            if url.startswith("https://ntfy.test/"):
+                if method == "POST":
+                    titles.append(json.loads(data)["title"])
+                return ""
+            if url.endswith("/health"):
+                return "Healthy"
+            if "/api/v3/" in url:
+                return json.dumps(paged([movie(), episode()]))
+            unexpected.append(url)
+            raise AssertionError(url)
+
+        def run(argv, timeout=RUN_TIMEOUT):
+            charge(timeout, RuntimeError("down"))
+            return stack(argv)
+
+        def free(path, timeout=DISK_TIMEOUT, read=None):
+            charge(timeout, OSError(5, "Input/output error"))
+            return 1, 500 * GB, 1000 * GB
+
+        path = self.dir / f"{command}.json"
+        path.write_text(state if isinstance(state, str) else json.dumps(state))
+        with unittest.mock.patch.object(sw, "filesystem_free", free), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            sw.main([command], dict(self.env, **(env or {})), http, run, NOW)
+        self.assertEqual(unexpected, [])  # a fake that fails the run would make the search vacuous
+        return sum(charged), titles, len(charged)
+
+    def worst(self, command, states, envs):
+        """The most any run from these states can be charged, and every title any of them sent.
+        Failing a call can add calls (a failed publish fails the run, which sends "is failing"), so
+        the count isn't taken from the run where nothing fails: each index is tried until one is past
+        the last call that run made, at which point nothing failed and later indices can't either."""
+        worst, titles = 0, set()
+        for state in states:
+            for env in envs:
+                for fail_at in itertools.count():
+                    seconds, published, calls = self.drive(command, state, fail_at, env)
+                    worst, titles = max(worst, seconds), titles | set(published)
+                    if fail_at >= calls:
+                        break
+        return worst, titles
+
+    def failure_states(self):
+        since = iso(NOW - 15 * MIN)
+        return [None, {"count": 1, "since": since},
+                {"count": 1, "since": since, "alerted": iso(NOW - 2 * DAY)}]
+
+    def test_a_check_fits_inside_the_units_start_timeout(self):
+        seen_once = {"service:sonarr": {"count": 1, "first": iso(NOW - 15 * MIN), "seen": iso(NOW - 15 * MIN),
+                                        "alerted": False, "description": "sonarr: exited (code 1)",
+                                        "absent": 0}}
+        overdue = {"due": iso(NOW - HOUR), "last": iso(NOW - 2 * DAY)}
+        states = ["not json"] + [
+            {key: value for key, value in (("failure", failure), ("tracked", tracked), ("heartbeat", beat))
+             if value is not None}
+            for failure in self.failure_states() for tracked in (None, seen_once) for beat in (None, overdue)]
+        worst, titles = self.worst("check", states, [{}, {"HEARTBEAT_GRACE": "off"}])
+        # Every notification a check can send was actually reached, so the search isn't vacuous.
+        self.assertEqual(titles, {"Stack watch on h started over", "Media stack on h: 1 problem",
+                                  "h is back online", "h is unreachable",
+                                  "Stack watch on h is working again", "Stack watch on h is failing"})
+        self.assertLessEqual(worst + self.OVERHEAD, unit_start_timeout(),
+                             f"a check can take {worst}s against a {unit_start_timeout()}s limit")
+        self.assertIn(f"a check at {worst} seconds", self.docs())
+
+    def test_a_stalled_run_fits_inside_the_units_start_timeout(self):
+        states = ["not json"] + [{"failure": f} if f else {} for f in self.failure_states()]
+        worst, titles = self.worst("stalled", states, [{}])
+        self.assertEqual(titles, {"Stack watch on h started over", "2 wanted titles not downloaded after 3 days",
+                                  "Stack watch on h is working again", "Stack watch on h is failing"})
+        self.assertLessEqual(worst + self.OVERHEAD, unit_start_timeout(),
+                             f"a stalled run can take {worst}s against a {unit_start_timeout()}s limit")
+        self.assertIn(f"a stalled run at {worst} seconds, plus {HTTP_TIMEOUT} for every page", self.docs())
+
+    def test_the_docs_quote_the_units_start_timeout(self):
+        self.assertIn(f"TimeoutStartSec={unit_start_timeout() // 60}min", self.docs())
+
+    def docs(self):
+        text = (Path(sw.__file__).resolve().parent.parent / "docs" / "stack-watch.md").read_text()
+        return " ".join(text.split())
 
 
 if __name__ == "__main__":
