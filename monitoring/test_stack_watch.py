@@ -1720,6 +1720,7 @@ class RunCheckTest(unittest.TestCase):
 
     UNPATCHED = "seerr: running without its download-tracker patch (see images/seerr/README.md)"
     CANT_CHECK = "seerr: can't check its download-tracker patch (details in the journal)"
+    UNRECOGNISED = "seerr: can't recognise its download tracker, so the patch is unchecked"
 
     def test_an_unpatched_seerr_alerts_like_any_other_problem(self):
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
@@ -1768,12 +1769,18 @@ class RunCheckTest(unittest.TestCase):
         unpatched" — docker exec into Seerr may be broken, or Seerr crash-looping. Saying the certain
         thing would send the artifex after the wrong fault on the one message he actually gets."""
         unpatched = seerr_stack(container("sonarr"), container("seerr"), tracker=UNPATCHED_TRACKER)
-        unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=RuntimeError("gone"))
-        state = {}
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self.check(state, unpatched, 0 * MIN), [])
-            [sent] = self.check(state, unreadable, 15 * MIN)
-        self.assertEqual(sent["message"], f"• {self.CANT_CHECK}")
+        # Every way the read can come back ambiguous, not just the one: a timeout, an error, and a
+        # file with no getQueue in it are three descriptions, and each has to survive on its own.
+        for failure, expected in ((subprocess.TimeoutExpired(["docker"], 5), self.CANT_CHECK),
+                                  (RuntimeError("gone"), self.CANT_CHECK),
+                                  ("", self.UNRECOGNISED)):
+            with self.subTest(failure=type(failure).__name__):
+                unreadable = seerr_stack(container("sonarr"), container("seerr"), tracker=failure)
+                state = {}
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.check(state, unpatched, 0 * MIN), [])
+                    [sent] = self.check(state, unreadable, 15 * MIN)
+                self.assertEqual(sent["message"], f"• {expected}")
 
     def test_the_wording_is_pinned_from_the_run_after_the_alert_went_out(self):
         """The boundary itself. CONSECUTIVE_RUNS is 2, so the run reaching a count of 2 is the run

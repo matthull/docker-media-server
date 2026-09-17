@@ -408,6 +408,21 @@ Run these from the repo root, one step at a time.
     docker rm -f seerr-negctl
     ```
 
+    **To force the other branch — one unpatched sighting, then a read that fails — remove the
+    container between the two runs instead of after them:**
+
+    ```bash
+    python3 /tmp/negctl.py       # 1st: the sighting. Nothing is sent yet.
+    docker rm -f seerr-negctl    # now the exec has nothing to talk to
+    python3 /tmp/negctl.py       # 2nd: "seerr: can't check its download-tracker patch"
+    HEARTBEAT_GRACE=off python3 monitoring/stack_watch.py check --test   # x2: "… all clear"
+    ```
+
+    The second run is the one that publishes, and it must say `can't check`, not `running without`:
+    the wording is held only for an alert that has already gone out. Getting any `seerr:` patch
+    sentence at all also proves the redirect was in place — without it, the removed container would
+    be reported as `seerr: no container` and the patch check would never be asked.
+
 The daily re-send is deliberately not forceable this way: `--test` drops the spacing *between*
 different alerts, and giving it a zero re-send interval too would make every repeated `--test` check
 in the steps above publish a duplicate. If you do need to see one, run step 5's first two commands,
