@@ -195,6 +195,8 @@ Once Jellyfin can delete, also set **Unmonitor Deleted Movies** (Radarr) and **U
 Episodes** (Sonarr) under Settings > Media Management. Otherwise a title deleted in Jellyfin stays
 monitored and missing. The arr can grab it again as soon as a matching release appears in RSS. If
 [stack watch](stack-watch.md) is installed, that title will also be reported as a stalled request.
+The trade-off: *any* file that goes missing is then unmonitored quietly at the arr's next rescan,
+including one lost by accident, and stack watch no longer reports it.
 
 ## Reaching a Jellyfin that is not in this stack
 
