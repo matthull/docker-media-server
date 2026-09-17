@@ -79,9 +79,10 @@ Watch) and its other pages describe upstream's stack.
 
 `.github/workflows/wiki.yml` is inherited and **disabled on this fork**, as is `tag.yml`
 (`gh workflow list -a`; re-enable with `gh workflow enable`). Until 2026-09-16 no workflow here had
-ever run; Actions started running that day, around the first push of `build-seerr.yml` (what
-switched them on is not established), and `tag.yml` failed on the very next push to `main` exactly
-as described below before both were disabled. The wiki action rewrites `x.md` links to `x` on
+ever run. Actions started running that day, around 23:48 UTC, when `build-seerr.yml` was first
+pushed on a branch; what switched them on is not established. `tag.yml` failed with a 403 on a push
+to `main` seconds before the first `build-seerr` run, exactly as described below, and both were then
+disabled. `release.yml` is still enabled but only fires on `v*` tags, which only `tag.yml` creates. The wiki action rewrites `x.md` links to `x` on
 publish, so file links stay correct if a wiki is ever turned on. **Do not re-enable `tag.yml`.**
 That workflow runs on every push to `main`. It rewrites `version.txt` and `changelog.md`, commits
 them as upstream's maintainer, then pushes to `main` and tags. It declares no `permissions:`,
@@ -378,15 +379,17 @@ back to `image:` — see `images/seerr/README.md` for the measurements and for w
 silently revert it. If a bump makes `docker compose up -d` fail in the patch script, that is the
 design working: read the new `downloadtracker.js` and update the `sed`, don't bypass it.
 
-**A failed `seerr` build is only harmless on a warm host.** `up -d` builds before it starts anything,
+**A failed `seerr` build is only harmless on a warm host** — any failed build, not only the patch
+script (registry down, disk full, base digest gone). `up -d` builds before it starts anything,
 so a failed build leaves running containers running, but stopped ones stay stopped, and after
 `docker compose down`, a fresh clone or a migration **no service in the stack starts at all**.
 `.github/workflows/build-seerr.yml` builds the image (and checks it has zero call sites) on every PR
 and every push to `main` touching `images/seerr/`, `docker-compose.yml` or the workflow. A push
 straight to `main` is only checked after it lands, so **check that the latest "Build seerr image"
 run on `main` is green before any `down`, restart-from-cold or migration**. Recovery commands are in
-`images/seerr/README.md`. Renovate's config is inherited from upstream but has opened nothing on
-this fork, so `FROM` bumps arrive by hand for now.
+`images/seerr/README.md`. Renovate's config is inherited from upstream but Renovate has done
+nothing on this fork (its `renovate/*` branches here were copied from upstream at fork time), so
+`FROM` bumps arrive by hand for now.
 
 **Update this stack with a plain `docker compose up -d`.** `--pull always` and `--no-build` both skip
 the build silently (exit 0, no warning) and keep the old image, which leaves `seerr` on a stale base

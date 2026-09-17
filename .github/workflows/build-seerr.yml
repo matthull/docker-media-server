@@ -12,6 +12,7 @@ on:
     paths:
       - "images/seerr/**"
       - "docker-compose.yml"
+      - ".env.example"
       - ".github/workflows/build-seerr.yml"
   push:
     branches:
@@ -19,6 +20,7 @@ on:
     paths:
       - "images/seerr/**"
       - "docker-compose.yml"
+      - ".env.example"
       - ".github/workflows/build-seerr.yml"
   workflow_dispatch:
 permissions:

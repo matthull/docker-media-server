@@ -83,7 +83,9 @@ Both guard directions are tested, not assumed — see the negative controls belo
 ### A failed build on a cold start takes the whole stack down
 
 "The old image keeps serving" is only true on a **warm** host. `docker compose up -d` builds `seerr`
-before it creates or starts any container, and a failed build aborts the entire command. So:
+before it creates or starts any container, and a failed build aborts the entire command — *any*
+failed build, not only the patch script: an unreachable registry, a full disk, or a base digest that
+no longer resolves do the same, and a green CI run guards against none of those. So:
 
 - **Containers already running** stay running (the documented warm case).
 - **Containers that exist but are stopped** (`docker compose stop`) stay stopped — *all* of them.
@@ -97,24 +99,28 @@ Reproduced 2026-09-16 with a throwaway two-service project (a failing `build:` s
 be the warm case — Docker restarts `restart: unless-stopped` containers itself, without Compose or a
 build — but that part is inferred from the restart policy, not tested.
 
-**Getting the rest of the stack up while the patch is broken:**
+**Getting the stack back while the build is broken.** From the repo directory:
 
 ```sh
-# containers exist but are stopped: start them without building
-docker compose start
-
-# no containers: start every service except seerr
+# 1. everything except seerr (nothing here depends_on seerr, and seerr is not built)
 docker compose up -d $(docker compose config --services | grep -vx seerr)
+
+# 2. seerr itself, built from the last commit whose images/seerr built cleanly
+git log --oneline -- images/seerr            # pick the last known-good commit
+git checkout <good-commit> -- images/seerr
+docker compose up -d seerr
+git checkout HEAD -- images/seerr            # put the working tree back
 ```
 
-Both verified against the same throwaway project. `docker compose up -d --no-build` does **not**
-help on a cold host: with no seerr image it fails (`No such image`, exit 1) and leaves the other
-containers created but not started. Nothing in this stack `depends_on` seerr, so excluding it is safe.
-Then fix the patch as in [When a bump breaks the build](#when-a-bump-breaks-the-build).
+Step 1 was verified against the throwaway project with no containers present; `docker compose start`
+(no build) also verified for the stopped-containers case. Step 2 is plain `git` and not separately
+tested. `docker compose up -d --no-build` does **not** help on a cold host: with no seerr image it
+fails (`No such image`, exit 1) and leaves the other containers created but not started. Then fix the
+patch as in [When a bump breaks the build](#when-a-bump-breaks-the-build).
 
 **What catches it before it gets that far:** `.github/workflows/build-seerr.yml` builds this image,
 through the same Compose definition, on every pull request and every push to `main` that touches
-`images/seerr/`, `docker-compose.yml` or the workflow, and then checks the built image itself for
+`images/seerr/`, `docker-compose.yml`, `.env.example` or the workflow, and then checks the built image itself for
 zero `refreshMonitoredDownloads` references. Its limits:
 
 - On a pull request a red check stops the merge only if someone (or Renovate) respects it. There is
@@ -123,8 +129,11 @@ zero `refreshMonitoredDownloads` references. Its limits:
 - A direct push to `main` is built **after** it lands; the run reports the breakage, it does not
   prevent it. **A red "Build seerr image" run on `main` means: do not `down` or migrate this stack
   until it is green.**
-- Renovate's config is inherited from upstream, but as of 2026-09-16 Renovate has opened no pull
-  request on this fork, so `FROM` bumps currently arrive by hand.
+- Renovate's config is inherited from upstream, but as of 2026-09-16 Renovate has done nothing on
+  this fork: no pull request, and the `renovate/*` branches here are upstream's, copied when the fork
+  was created (e.g. `renovate/linuxserver-bazarr-1.x` is the head of upstream PR #1032, committed
+  hours before the fork existed). `FROM` bumps currently arrive by hand. If Renovate is ever enabled
+  here, it opens pull requests by default, which this workflow does build.
 
 Negative controls for the workflow, run on GitHub (throwaway PR #2, closed): a patch regex that no
 longer matches failed at the build step; a patch script neutered to `exit 0` built an image with 2

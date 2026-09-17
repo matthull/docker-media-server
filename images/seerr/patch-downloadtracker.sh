@@ -27,8 +27,9 @@
 # Loudly, and on the build host rather than in production. If the two call sites are not
 # found exactly as expected -- an upstream refactor, a rename, a bundler change -- this
 # script exits non-zero, `docker compose build seerr` fails, no image is produced, and
-# the already-built patched image keeps serving. The one thing it will never do is
-# quietly hand back an unpatched Seerr.
+# the already-built patched image keeps serving -- on a warm host only: on a cold
+# `docker compose up -d` a failed build starts no service at all (see README.md). The one
+# thing it will never do is quietly hand back an unpatched Seerr.
 #
 # Runs against busybox sed/grep (the base image is Alpine), so the regex is POSIX BRE.
 
