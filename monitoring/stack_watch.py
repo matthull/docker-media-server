@@ -273,12 +273,14 @@ def http_request(method: str, url: str, headers: dict | None = None, data: bytes
     urlopen's own timeout is not that: it bounds each socket operation, so a reply trickling in
     (measured: 3s under a 0.5s timeout) or a name slow to resolve runs on past it. The unit's time
     limit is checked against the sum of these timeouts (RunTimeBudgetTest), so each has to be a real
-    ceiling. A request given up on may still reach the server before the process exits; that was
-    already possible when it was the reply, not the request, that timed out."""
+    ceiling. A request given up on keeps going for the rest of the run and may still reach the server
+    before the process exits. A reply that timed out already left that uncertainty; the window is
+    now the rest of the run rather than one request."""
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    urlopen = urllib.request.urlopen  # looked up now, not whenever the thread gets to run
 
     def fetch() -> str:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return resp.read().decode()
     return give_up_after(timeout, "the request", fetch)
 

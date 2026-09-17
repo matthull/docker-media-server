@@ -230,7 +230,8 @@ To remove it: `./monitoring/install-stack-watch.sh --uninstall`.
 Logs are in `journalctl --user -u 'media-stack-*'`, and state is in `~/.local/state/media-stack-watch/`.
 
 **How long a run can take.** Both units have `TimeoutStartSec=10min`. systemd kills a run that
-outlasts that, and nothing the run decided is saved. Every call a run makes has a hard limit:
+outlasts that, and nothing the run decided is saved. Every network request and command a run makes
+has a hard limit:
 - Docker commands: 60 seconds, except the read of Seerr's tracker (5).
 - Jellyfin: 10 seconds.
 - Each free-space read: 20 seconds.
@@ -446,6 +447,12 @@ Add `&scheduled=1` to also list messages still waiting to be sent.
   limit, and then systemd kills the run with nothing it decided saved. The next check starts again
   from the state before. Free-space reads, the other calls that can block this way, are abandoned
   instead.
+- **Reading files on a hung mount.** The state file, `.env` and the *arrs' `config.xml` are read
+  with no limit. On a host where `CONFIG_ROOT` shares the media drive, a mount that hangs can hold
+  the run until systemd kills it.
+- **A very long wanted list or queue.** The digest pages through each one in full. On top of its
+  120-second worst case, the 10-minute limit leaves room for about 22 extra pages (roughly 5,500
+  titles). A backlog larger than that, on an *arr slow to answer, can outlast the limit.
 - **A container stuck in `health: starting`** counts as fine. Docker normally turns that into
   `unhealthy` once its retries run out.
 - **An inferred fallback that becomes too small for the threshold while it is already a problem.**

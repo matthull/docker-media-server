@@ -2264,8 +2264,10 @@ class RunTimeBudgetTest(unittest.TestCase):
     have told whoever added the next check that the sum no longer held. It is derived instead.
     main() is driven through every combination of the state a run can start from and the one call
     it fails at, and every external call is charged the whole timeout the code gives it, as if each
-    one hung until the last moment. A new check, a new publish or a raised timeout lands in the sum
-    without anyone having to remember it.
+    one hung until the last moment. A raised timeout, or a new call or publish on a path these
+    scenarios reach, lands in the sum without anyone having to remember it. A check behind a new
+    setting, or behind a container state the fake stack never produces, does not: add it to the
+    scenarios along with the check.
 
     A charge is only a bound if the timeout is a ceiling; HttpRequestTest is what makes it one for
     http_request. docs/stack-watch.md quotes the results, and is checked against them here."""
